@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "banking-source-simulator"
+version = "0.1.0"
+description = "Stateful PostgreSQL banking data source for learning data engineering"
+requires-python = ">=3.14"
+dependencies = ["psycopg[binary]>=3.3,<4"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+bank-sim = "bank_sim.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+bank_sim = ["schema.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires TEST_DATABASE_URL and creates isolated test schemas"]

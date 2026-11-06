@@ -1,0 +1,22 @@
+[database]
+schema = "core_sim"
+
+[seed]
+random_seed = 42
+customers = 100
+merchants = 20
+opening_balance = 100_000_000 # VND per customer; merchants start at zero
+
+[generator]
+rate = 1.0                 # requests/second in realtime mode
+amount_min = 10_000
+amount_max = 500_000
+
+# Relative weights; need not sum to 100. Each request chooses one scenario.
+# Refund/retry falls back to a normal payment if no eligible transaction exists.
+[generator.scenarios]
+normal = 90
+insufficient_funds = 3
+decline = 3
+refund = 2
+retry = 2
