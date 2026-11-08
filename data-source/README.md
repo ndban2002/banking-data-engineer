@@ -67,6 +67,7 @@ set +a
 
 bank-sim init-db
 bank-sim seed
+bank-sim generate --mode realtime --rate 1 --duration 300
 ```
 
 `DATABASE_URL` trỏ vào đầu local của tunnel, ví dụ `127.0.0.1:15432`. `PG_REMOTE_HOST` là địa chỉ database nhìn từ máy SSH; dùng `127.0.0.1` nếu PostgreSQL nằm trên chính máy đó. SSH và PostgreSQL dùng tài khoản riêng. Chỉ lưu đường dẫn private key trong `.env`, giữ file key trong `~/.ssh/`.
