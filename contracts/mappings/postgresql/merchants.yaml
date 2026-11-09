@@ -1,0 +1,97 @@
+mapping_version: 1
+source:
+  system: banking-simulator
+  type: postgresql
+  database: bank
+  schema: core_sim
+  table: merchants
+  contract: ../../sources/postgresql/core_sim/merchants.yaml
+targets:
+  bronze:
+    catalog: lakehouse
+    schema: bronze
+    table: merchants
+    write_mode: append
+    grain: one row per source record observed in an ingestion batch
+  silver:
+    catalog: lakehouse
+    schema: silver
+    table: dim_merchants
+    write_mode: scd2
+    grain: one row per merchant attribute version
+    business_key: [merchant_id]
+    scd2:
+      tracked_columns: [merchant_name, mcc, region, channel]
+      effective_time: _ingested_at
+      effective_time_semantics: observed_time
+      columns:
+        surrogate_key: merchant_sk
+        valid_from: valid_from
+        valid_to: valid_to
+        current_flag: is_current
+        hash: record_hash
+  ingestion_metadata:
+    - name: _source_system
+      expression: "banking-simulator"
+    - name: _source_schema
+      expression: "core_sim"
+    - name: _source_table
+      expression: "merchants"
+    - name: _ingested_at
+      expression: ingestion timestamp in UTC
+    - name: _batch_id
+      expression: unique identifier of the ingestion batch
+    - name: _ingestion_date
+      expression: UTC date derived from _ingested_at
+column_mappings:
+  - source: id
+    bronze: id
+    silver: merchant_id
+    transformation: rename; preserve UUID as natural key
+    nullable: false
+  - source: name
+    bronze: name
+    silver: merchant_name
+    transformation: trim leading and trailing whitespace
+    nullable: false
+  - source: mcc
+    bronze: mcc
+    silver: mcc
+    transformation: validate exactly four digits
+    nullable: false
+  - source: region
+    bronze: region
+    silver: region
+    transformation: normalize whitespace and casing; retain source region code
+    nullable: false
+  - source: channel
+    bronze: channel
+    silver: channel
+    transformation: validate QR or POS
+    nullable: false
+  - source: created_at
+    bronze: created_at
+    silver: created_at
+    transformation: preserve timestamp and normalize to UTC; not an update watermark
+    nullable: false
+quality_rules:
+  - id: merchants_id_unique
+    rule: id is unique in the source snapshot
+    action: quarantine violating records
+  - id: merchants_required_fields
+    rule: id, name, mcc, region, and channel are not null
+    action: quarantine violating records
+  - id: merchants_mcc_format
+    rule: mcc matches ^[0-9]{4}$
+    action: quarantine violating records
+  - id: merchants_channel_domain
+    rule: channel is QR or POS
+    action: quarantine violating records
+load_strategy:
+  initial: full_snapshot
+  subsequent: full_snapshot_and_compare
+  change_detection: compare complete snapshots by id and hash of tracked Silver columns
+  deletion_detection: mark deleted only when snapshot completeness is confirmed and delete policy is enabled
+  limitations:
+    - source has no updated_at column
+    - SCD2 valid_from records observation time, not exact source-effective time

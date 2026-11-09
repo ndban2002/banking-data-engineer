@@ -1,0 +1,149 @@
+mapping_version: 1
+source:
+  system: banking-simulator
+  type: postgresql
+  database: bank
+  schema: core_sim
+  table: transactions
+  contract: ../../sources/postgresql/core_sim/transactions.yaml
+targets:
+  bronze:
+    catalog: lakehouse
+    schema: bronze
+    table: transactions
+    write_mode: append
+    grain: one row per source record observed in an ingestion batch
+  silver:
+    catalog: lakehouse
+    schema: silver
+    table: fact_transactions
+    write_mode: merge
+    grain: one latest-state row per transaction request
+    business_key: [transaction_id]
+  ingestion_metadata:
+    - name: _source_system
+      expression: "banking-simulator"
+    - name: _source_schema
+      expression: "core_sim"
+    - name: _source_table
+      expression: "transactions"
+    - name: _ingested_at
+      expression: ingestion timestamp in UTC
+    - name: _batch_id
+      expression: unique identifier of the ingestion batch
+    - name: _ingestion_date
+      expression: UTC date derived from _ingested_at
+column_mappings:
+  - source: id
+    bronze: id
+    silver: transaction_id
+    transformation: rename; preserve UUID as business key
+    nullable: false
+  - source: request_id
+    bronze: request_id
+    silver: request_id
+    transformation: preserve unique idempotency key
+    nullable: false
+  - source: kind
+    bronze: kind
+    silver: transaction_type
+    transformation: validate PAYMENT or REFUND
+    nullable: false
+  - source: source_account_id
+    bronze: source_account_id
+    silver: source_account_id
+    transformation: preserve and validate account foreign key and direction by transaction type
+    nullable: false
+  - source: destination_account_id
+    bronze: destination_account_id
+    silver: destination_account_id
+    transformation: preserve and validate account foreign key and direction by transaction type
+    nullable: false
+  - source: amount
+    bronze: amount
+    silver: amount_vnd
+    transformation: rename; require positive whole-VND integer
+    nullable: false
+  - source: currency
+    bronze: currency
+    silver: currency
+    transformation: validate VND
+    nullable: false
+  - source: channel
+    bronze: channel
+    silver: channel
+    transformation: validate QR or POS
+    nullable: false
+  - source: status
+    bronze: status
+    silver: status
+    transformation: validate PENDING, SUCCEEDED, or FAILED
+    nullable: false
+  - source: error_code
+    bronze: error_code
+    silver: error_code
+    transformation: preserve nullable; required only when status is FAILED
+    nullable: true
+  - source: original_transaction_id
+    bronze: original_transaction_id
+    silver: original_transaction_id
+    transformation: preserve nullable foreign key; required for REFUND and references original payment
+    nullable: true
+  - source: requested_decline
+    bronze: requested_decline
+    silver: requested_decline
+    transformation: preserve simulated-decline request flag
+    nullable: false
+  - source: occurred_at
+    bronze: occurred_at
+    silver: occurred_at
+    transformation: preserve timestamp and normalize to UTC; business/event time
+    nullable: false
+  - source: created_at
+    bronze: created_at
+    silver: created_at
+    transformation: preserve timestamp and normalize to UTC; database insertion time
+    nullable: false
+  - source: updated_at
+    bronze: updated_at
+    silver: updated_at
+    transformation: preserve timestamp and normalize to UTC; incremental watermark
+    nullable: false
+quality_rules:
+  - id: transactions_id_unique
+    rule: id is unique
+    action: quarantine violating records
+  - id: transactions_request_id_unique
+    rule: request_id is unique
+    action: quarantine conflicting request IDs
+  - id: transactions_positive_amount
+    rule: amount is greater than zero
+    action: quarantine violating records
+  - id: transactions_currency_vnd
+    rule: currency is VND
+    action: quarantine violating records
+  - id: transactions_status_error_consistency
+    rule: FAILED requires error_code; PENDING and SUCCEEDED require null error_code
+    action: quarantine violating records
+  - id: transactions_account_relationships
+    rule: source and destination accounts exist and differ
+    action: quarantine violating records
+  - id: transactions_refund_consistency
+    rule: REFUND references a successful PAYMENT, reverses its accounts, and matches its amount and channel
+    action: quarantine violating records
+  - id: transactions_refund_limit
+    rule: at most one successful full refund exists per original payment
+    action: quarantine violating records
+load_strategy:
+  initial: full_snapshot
+  subsequent: incremental_polling
+  watermark_column: updated_at
+  overlap: 5 minutes
+  extraction_order: [updated_at, id]
+  silver_merge_key: [transaction_id]
+  watermark_commit: only_after_all_required_writes_succeed
+  notes:
+    - retain PENDING, SUCCEEDED, and FAILED in Bronze and Silver current state
+    - a transaction row contains latest state, not every lifecycle event
+    - timestamp polling can miss intermediate status transitions and hard deletes
+    - replaying a batch must not duplicate the current Silver transaction row

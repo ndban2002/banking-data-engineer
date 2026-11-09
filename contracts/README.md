@@ -4,11 +4,19 @@
 
 ```text
 contracts/
+├── mappings/
+│   └── postgresql/
+│       ├── customers.yaml
+│       ├── merchants.yaml
+│       ├── accounts.yaml
+│       └── transactions.yaml
 └── sources/
     └── postgresql/
         └── core_sim/
             └── accounts.yaml
 ```
+
+Tài liệu data model và chiến lược ingestion ở [DATA_MODELING_AND_INGESTION.md](DATA_MODELING_AND_INGESTION.md). Source-to-target mapping được quản lý bằng YAML theo từng bảng trong [mappings/postgresql](mappings/postgresql/).
 
 Contract nguồn mô tả cấu trúc và ý nghĩa dữ liệu mà pipeline có thể kỳ vọng. DDL thực tế của simulator nằm trong [schema.sql](../data-source/src/bank_sim/schema.sql); khi thay đổi cấu trúc nguồn, cập nhật contract tương ứng.
 

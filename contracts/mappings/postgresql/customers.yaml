@@ -1,0 +1,81 @@
+mapping_version: 1
+source:
+  system: banking-simulator
+  type: postgresql
+  database: bank
+  schema: core_sim
+  table: customers
+  contract: ../../sources/postgresql/core_sim/customers.yaml
+targets:
+  bronze:
+    catalog: lakehouse
+    schema: bronze
+    table: customers
+    write_mode: append
+    grain: one row per source record observed in an ingestion batch
+  silver:
+    catalog: lakehouse
+    schema: silver
+    table: dim_customers
+    write_mode: scd2
+    grain: one row per customer attribute version
+    business_key: [customer_id]
+    scd2:
+      tracked_columns: [customer_name, region]
+      effective_time: _ingested_at
+      effective_time_semantics: observed_time
+      columns:
+        surrogate_key: customer_sk
+        valid_from: valid_from
+        valid_to: valid_to
+        current_flag: is_current
+        hash: record_hash
+  ingestion_metadata:
+    - name: _source_system
+      expression: "banking-simulator"
+    - name: _source_schema
+      expression: "core_sim"
+    - name: _source_table
+      expression: "customers"
+    - name: _ingested_at
+      expression: ingestion timestamp in UTC
+    - name: _batch_id
+      expression: unique identifier of the ingestion batch
+    - name: _ingestion_date
+      expression: UTC date derived from _ingested_at
+column_mappings:
+  - source: id
+    bronze: id
+    silver: customer_id
+    transformation: rename; preserve UUID as natural key
+    nullable: false
+  - source: name
+    bronze: name
+    silver: customer_name
+    transformation: trim leading and trailing whitespace
+    nullable: false
+  - source: region
+    bronze: region
+    silver: region
+    transformation: normalize whitespace and casing; retain source region code
+    nullable: false
+  - source: created_at
+    bronze: created_at
+    silver: created_at
+    transformation: preserve timestamp and normalize to UTC; not an update watermark
+    nullable: false
+quality_rules:
+  - id: customers_id_unique
+    rule: id is unique in the source snapshot
+    action: quarantine violating records
+  - id: customers_required_fields
+    rule: id, name, and region are not null
+    action: quarantine violating records
+load_strategy:
+  initial: full_snapshot
+  subsequent: full_snapshot_and_compare
+  change_detection: compare complete snapshots by id and hash of tracked Silver columns
+  deletion_detection: mark deleted only when snapshot completeness is confirmed and delete policy is enabled
+  limitations:
+    - source has no updated_at column
+    - SCD2 valid_from records observation time, not exact source-effective time

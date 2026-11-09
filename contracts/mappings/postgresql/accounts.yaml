@@ -1,0 +1,104 @@
+mapping_version: 1
+source:
+  system: banking-simulator
+  type: postgresql
+  database: bank
+  schema: core_sim
+  table: accounts
+  contract: ../../sources/postgresql/core_sim/accounts.yaml
+targets:
+  bronze:
+    catalog: lakehouse
+    schema: bronze
+    table: accounts
+    write_mode: append
+    grain: one row per source record observed in an ingestion batch
+  silver:
+    catalog: lakehouse
+    schema: silver
+    table: dim_accounts
+    write_mode: merge
+    grain: one current row per account
+    business_key: [account_id]
+  ingestion_metadata:
+    - name: _source_system
+      expression: "banking-simulator"
+    - name: _source_schema
+      expression: "core_sim"
+    - name: _source_table
+      expression: "accounts"
+    - name: _ingested_at
+      expression: ingestion timestamp in UTC
+    - name: _batch_id
+      expression: unique identifier of the ingestion batch
+    - name: _ingestion_date
+      expression: UTC date derived from _ingested_at
+column_mappings:
+  - source: id
+    bronze: id
+    silver: account_id
+    transformation: rename; preserve UUID as business key
+    nullable: false
+  - source: customer_id
+    bronze: customer_id
+    silver: customer_id
+    transformation: preserve nullable foreign key; exactly one owner column must be populated
+    nullable: true
+  - source: merchant_id
+    bronze: merchant_id
+    silver: merchant_id
+    transformation: preserve nullable foreign key; exactly one owner column must be populated
+    nullable: true
+  - source: currency
+    bronze: currency
+    silver: currency
+    transformation: validate VND
+    nullable: false
+  - source: opening_balance
+    bronze: opening_balance
+    silver: opening_balance_vnd
+    transformation: rename; preserve non-negative whole-VND integer
+    nullable: false
+  - source: balance
+    bronze: balance
+    silver: balance_vnd
+    transformation: rename; preserve non-negative whole-VND current balance
+    nullable: false
+  - source: created_at
+    bronze: created_at
+    silver: created_at
+    transformation: preserve timestamp and normalize to UTC
+    nullable: false
+  - source: updated_at
+    bronze: updated_at
+    silver: updated_at
+    transformation: preserve timestamp and normalize to UTC; incremental watermark
+    nullable: false
+quality_rules:
+  - id: accounts_id_unique
+    rule: id is unique
+    action: quarantine violating records
+  - id: accounts_exactly_one_owner
+    rule: exactly one of customer_id and merchant_id is non-null
+    action: quarantine violating records
+  - id: accounts_owner_foreign_key
+    rule: non-null owner ID references its customer or merchant row
+    action: quarantine violating records
+  - id: accounts_nonnegative_balances
+    rule: opening_balance and balance are non-negative
+    action: quarantine violating records
+  - id: accounts_currency_vnd
+    rule: currency is VND
+    action: quarantine violating records
+load_strategy:
+  initial: full_snapshot
+  subsequent: incremental_polling
+  watermark_column: updated_at
+  overlap: 5 minutes
+  extraction_order: [updated_at, id]
+  silver_merge_key: [account_id]
+  watermark_commit: only_after_all_required_writes_succeed
+  notes:
+    - balance is current state and must not be treated as historical balance
+    - if account SCD2 is enabled, track owner or currency changes separately; do not create a new dimension version for every balance update
+    - timestamp polling does not detect hard deletes or intermediate values between runs
