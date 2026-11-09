@@ -8,3 +8,4 @@ dist/
 .env
 config.toml
 .DS_Store
+DATA_MODELING_AND_INGESTION.md
