@@ -2,6 +2,12 @@
 
 Project tự học lakehouse và xử lý dữ liệu ngân hàng theo hai luồng batch và streaming. Các thành phần được tổ chức thành thư mục riêng để quản lý dependency, cấu hình và kiểm thử độc lập.
 
+Lộ trình tổng quát: hoàn thành batch có đối soát và khả năng chạy lại trước, dùng **Dagster OSS** điều phối, thêm **ClickHouse → Grafana** phục vụ phân tích, rồi mở rộng **Debezium → Kafka → Spark Structured Streaming → ClickHouse**. Iceberg quản lý Bronze/Silver/Gold trên object storage; PostgreSQL là nguồn nghiệp vụ. Plan và tiêu chí nghiệm thu nằm trong [Data Modeling & Ingestion Strategy](contracts/DATA_MODELING_AND_INGESTION.md#11-lộ-trình-học-và-tiêu-chí-nghiệm-thu).
+
+![Roadmap tổng quát Banking Data Platform](docs/assets/banking-platform-roadmap.png)
+
+[Tải roadmap PNG](docs/assets/banking-platform-roadmap.png). Sơ đồ thể hiện kiến trúc mục tiêu và thứ tự học: batch → modeling và kiểm thử → Dagster → ClickHouse → streaming. Trino là bài mở rộng tùy chọn.
+
 ```text
 banking-project/
 ├── README.md
@@ -9,15 +15,16 @@ banking-project/
 ├── data-source/     # Simulator thanh toán QR/POS → PostgreSQL
 ├── batch/           # Phase 1: batch lakehouse, Bronze → Silver → Gold
 ├── streaming/       # Phase 2: CDC, Kafka và xử lý realtime
-└── contracts/       # Định nghĩa dữ liệu dùng chung
+├── contracts/       # Định nghĩa dữ liệu dùng chung và plan
+└── docs/assets/     # Một ảnh roadmap tổng quát
 ```
 
-| Thành phần | Trạng thái | Hướng dẫn |
+| Thành phần | Phạm vi | Hướng dẫn |
 | --- | --- | --- |
-| `data-source/` | Đã có simulator Python + PostgreSQL | [README simulator](data-source/README.md) |
-| `batch/` | Dành cho triển khai phase 1 | [README batch](batch/README.md) |
-| `streaming/` | Dành cho triển khai phase 2 | [README streaming](streaming/README.md) |
-| `contracts/` | Contract nguồn PostgreSQL theo ODCS 3.2 | [README contracts](contracts/README.md) |
+| `data-source/` | Simulator Python + PostgreSQL | [README simulator](data-source/README.md) |
+| `batch/` | Batch lakehouse Bronze → Silver → Gold | [README batch](batch/README.md) |
+| `streaming/` | CDC, Kafka và xử lý realtime | [README streaming](streaming/README.md) |
+| `contracts/` | Contract nguồn, mapping và plan | [README contracts](contracts/README.md) |
 
 ## Chạy simulator
 
