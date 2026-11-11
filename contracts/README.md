@@ -4,6 +4,8 @@
 
 ```text
 contracts/
+├── DATA_MODELING_AND_INGESTION.md
+├── README.md
 ├── mappings/
 │   └── postgresql/
 │       ├── customers.yaml
@@ -13,10 +15,15 @@ contracts/
 └── sources/
     └── postgresql/
         └── core_sim/
-            └── accounts.yaml
+            ├── accounts.yaml
+            ├── customers.yaml
+            ├── merchants.yaml
+            └── transactions.yaml
 ```
 
 Tài liệu data model và chiến lược ingestion ở [DATA_MODELING_AND_INGESTION.md](DATA_MODELING_AND_INGESTION.md). Source-to-target mapping được quản lý bằng YAML theo từng bảng trong [mappings/postgresql](mappings/postgresql/).
+
+Mapping v2 làm rõ phạm vi uniqueness, giữ giao dịch FAILED hợp lệ, tách checkpoint ingestion/processing và giới hạn của polling/SCD2. Đây là specification, chưa có runner đọc YAML để thực thi các quy tắc. Mục tiêu Silver SCD2 được triển khai sau khi current-state pipeline đã đúng.
 
 Contract nguồn mô tả cấu trúc và ý nghĩa dữ liệu mà pipeline có thể kỳ vọng. DDL thực tế của simulator nằm trong [schema.sql](../data-source/src/bank_sim/schema.sql); khi thay đổi cấu trúc nguồn, cập nhật contract tương ứng.
 

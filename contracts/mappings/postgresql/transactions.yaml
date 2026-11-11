@@ -1,4 +1,5 @@
-mapping_version: 1
+# Design specification only; these rules and checkpoints are not executed by this YAML.
+mapping_version: 2
 source:
   system: banking-simulator
   type: postgresql
@@ -52,12 +53,12 @@ column_mappings:
   - source: source_account_id
     bronze: source_account_id
     silver: source_account_id
-    transformation: preserve and validate account foreign key and direction by transaction type
+    transformation: preserve and validate account foreign key; enforce payment/refund direction only for SUCCEEDED
     nullable: false
   - source: destination_account_id
     bronze: destination_account_id
     silver: destination_account_id
-    transformation: preserve and validate account foreign key and direction by transaction type
+    transformation: preserve and validate account foreign key; enforce payment/refund direction only for SUCCEEDED
     nullable: false
   - source: amount
     bronze: amount
@@ -87,7 +88,7 @@ column_mappings:
   - source: original_transaction_id
     bronze: original_transaction_id
     silver: original_transaction_id
-    transformation: preserve nullable foreign key; required for REFUND and references original payment
+    transformation: preserve nullable foreign key; required for REFUND and null for PAYMENT; require a successful original PAYMENT only for a SUCCEEDED refund
     nullable: true
   - source: requested_decline
     bronze: requested_decline
@@ -111,11 +112,13 @@ column_mappings:
     nullable: false
 quality_rules:
   - id: transactions_id_unique
-    rule: id is unique
-    action: quarantine violating records
+    scope: source_snapshot_and_silver_current_state
+    rule: id is unique within one source snapshot; transaction_id is unique in Silver current state
+    action: quarantine conflicting source records; block publication if Silver uniqueness fails
   - id: transactions_request_id_unique
-    rule: request_id is unique
-    action: quarantine conflicting request IDs
+    scope: source_snapshot_and_silver_current_state
+    rule: request_id identifies one transaction within a source snapshot and Silver current state
+    action: quarantine request IDs mapped to conflicting transactions; block publication if Silver uniqueness fails
   - id: transactions_positive_amount
     rule: amount is greater than zero
     action: quarantine violating records
@@ -128,8 +131,14 @@ quality_rules:
   - id: transactions_account_relationships
     rule: source and destination accounts exist and differ
     action: quarantine violating records
+  - id: transactions_successful_payment_direction
+    rule: a SUCCEEDED PAYMENT moves from a customer account to a merchant account and matches that merchant's channel at settlement
+    action: validate against matching source state; quarantine confirmed violations
+  - id: transactions_refund_link_consistency
+    rule: REFUND has a non-self original_transaction_id referencing an existing transaction; PAYMENT has no original_transaction_id
+    action: quarantine violating records
   - id: transactions_refund_consistency
-    rule: REFUND references a successful PAYMENT, reverses its accounts, and matches its amount and channel
+    rule: a SUCCEEDED REFUND references a SUCCEEDED PAYMENT, reverses its accounts, matches its amount and channel, and has occurred_at at or after the payment
     action: quarantine violating records
   - id: transactions_refund_limit
     rule: at most one successful full refund exists per original payment
@@ -141,9 +150,23 @@ load_strategy:
   overlap: 5 minutes
   extraction_order: [updated_at, id]
   silver_merge_key: [transaction_id]
-  watermark_commit: only_after_all_required_writes_succeed
+  checkpoint_scope: [system, database, schema, table]
+  watermark_commit: only_after_bronze_append_and_accepted_batch_manifest_are_durable
+  silver_processing_checkpoint: separately_track_consumed_bronze_snapshots_and_commit_after_silver_and_quarantine_writes_succeed
   notes:
+    - repeated transaction and request IDs across Bronze observations are expected; source and Silver uniqueness rules do not apply across all Bronze rows
     - retain PENDING, SUCCEEDED, and FAILED in Bronze and Silver current state
+    - FAILED with INVALID_REFUND, INVALID_ACCOUNTS, or INVALID_CHANNEL is a valid rejected request; do not quarantine solely for failing a successful-movement rule
+    - PENDING requests have not completed business validation; retain them and measure pending age separately
+    - apply refund-limit checks to deduplicated latest state, not repeated Bronze observations
+    - validate cross-table rules against consistent input snapshots or an agreed cut-off; defer checks when a referenced row has not yet been ingested
+    - observed-time merchant history cannot prove the merchant channel at an earlier settlement; report that check as unverified when source history is unavailable
+    - use updated_at to order versions; id orders different source records and cannot break ties between versions of the same transaction
+    - identical payloads at the same updated_at may be deduplicated; conflicting payloads need an explicit source-version rule or quarantine, not arbitrary UUID ordering
+    - persist the input Bronze snapshot IDs for replay and prevent an older source version from overwriting newer Silver state
+    - serialize extraction per checkpoint scope; a downstream failure must be retried from durable Bronze without requiring extraction to remain uncommitted
+    - a five-minute overlap is a tolerance, not a no-loss guarantee; commits delayed beyond it can be missed because updated_at is assigned before commit
+    - use periodic full reconciliation or CDC for recovery from missed updates; an ordered extraction cursor is not a database commit position
     - a transaction row contains latest state, not every lifecycle event
     - timestamp polling can miss intermediate status transitions and hard deletes
     - replaying a batch must not duplicate the current Silver transaction row

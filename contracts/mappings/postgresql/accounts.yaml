@@ -1,4 +1,5 @@
-mapping_version: 1
+# Design specification only; these rules and checkpoints are not executed by this YAML.
+mapping_version: 2
 source:
   system: banking-simulator
   type: postgresql
@@ -76,8 +77,9 @@ column_mappings:
     nullable: false
 quality_rules:
   - id: accounts_id_unique
-    rule: id is unique
-    action: quarantine violating records
+    scope: source_snapshot_and_silver_current_state
+    rule: id is unique within one source snapshot; account_id is unique in Silver current state
+    action: quarantine conflicting source records; block publication if Silver uniqueness fails
   - id: accounts_exactly_one_owner
     rule: exactly one of customer_id and merchant_id is non-null
     action: quarantine violating records
@@ -97,8 +99,17 @@ load_strategy:
   overlap: 5 minutes
   extraction_order: [updated_at, id]
   silver_merge_key: [account_id]
-  watermark_commit: only_after_all_required_writes_succeed
+  checkpoint_scope: [system, database, schema, table]
+  watermark_commit: only_after_bronze_append_and_accepted_batch_manifest_are_durable
+  silver_processing_checkpoint: separately_track_consumed_bronze_snapshots_and_commit_after_silver_and_quarantine_writes_succeed
   notes:
+    - repeated account IDs across Bronze observations are expected; source and Silver uniqueness rules do not apply across all Bronze rows
+    - use updated_at to order versions; id orders different source records and cannot break ties between versions of the same account
+    - identical payloads at the same updated_at may be deduplicated; conflicting payloads need an explicit source-version rule or quarantine, not arbitrary UUID ordering
+    - persist the input Bronze snapshot IDs for replay and prevent an older source version from overwriting newer Silver state
+    - serialize extraction per checkpoint scope; a downstream failure must be retried from durable Bronze without requiring extraction to remain uncommitted
+    - a five-minute overlap is a tolerance, not a no-loss guarantee; commits delayed beyond it can be missed because updated_at is assigned before commit
+    - use periodic full reconciliation or CDC for recovery from missed updates; account and transaction comparisons need a consistent snapshot or agreed cut-off
     - balance is current state and must not be treated as historical balance
     - if account SCD2 is enabled, track owner or currency changes separately; do not create a new dimension version for every balance update
     - timestamp polling does not detect hard deletes or intermediate values between runs

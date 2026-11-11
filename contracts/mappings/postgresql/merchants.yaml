@@ -1,4 +1,5 @@
-mapping_version: 1
+# Design specification only; these rules and checkpoints are not executed by this YAML.
+mapping_version: 2
 source:
   system: banking-simulator
   type: postgresql
@@ -76,8 +77,13 @@ column_mappings:
     nullable: false
 quality_rules:
   - id: merchants_id_unique
+    scope: source_snapshot
     rule: id is unique in the source snapshot
     action: quarantine violating records
+  - id: merchants_scd2_current_unique
+    scope: silver_dimension
+    rule: at most one row per merchant_id has is_current true; validity intervals for a merchant do not overlap
+    action: block publication if violated
   - id: merchants_required_fields
     rule: id, name, mcc, region, and channel are not null
     action: quarantine violating records
@@ -92,6 +98,14 @@ load_strategy:
   subsequent: full_snapshot_and_compare
   change_detection: compare complete snapshots by id and hash of tracked Silver columns
   deletion_detection: mark deleted only when snapshot completeness is confirmed and delete policy is enabled
+  checkpoint_scope: [system, database, schema, table]
+  bronze_checkpoint_commit: only_after_complete_snapshot_is_durably_written_and_manifest_is_recorded
+  silver_processing_checkpoint: separately_track_consumed_bronze_snapshots_and_commit_after_silver_and_quarantine_writes_succeed
+  notes:
+    - repeated merchant IDs across Bronze observations and Silver historical versions are expected; uniqueness is scoped as specified above
+    - process accepted snapshots in recorded observation order; replay the same manifest without generating duplicate SCD2 versions
+    - conflicting payloads for one merchant in a snapshot must not be resolved by arbitrary row or UUID order
+    - retain the observed-time meaning of valid_from; historical facts before the first observation require an explicit unknown-member or documented current-dimension baseline policy
   limitations:
     - source has no updated_at column
     - SCD2 valid_from records observation time, not exact source-effective time
