@@ -27,7 +27,7 @@ bank-sim generate --mode realtime --rate 1 --duration 60
 bank-sim verify
 ```
 
-`bank-sim generate --mode realtime` chạy liên tục ở mức mặc định 1 yêu cầu/giây. Nhấn **Ctrl+C** hoặc gửi SIGTERM để yêu cầu dừng sau giao dịch đang xử lý; CLI in thống kê khi kết thúc. Nếu bị kill đột ngột, lần `generate` tiếp theo xử lý các giao dịch `PENDING` trước khi sinh thêm.
+`bank-sim generate --mode realtime` chạy liên tục với nhịp mục tiêu trung bình 1 yêu cầu/giây. Mặc định khoảng cách giữa các lần bắt đầu yêu cầu có dao động để luồng bớt đều như đồng hồ; database chậm có thể làm tốc độ thực tế thấp hơn. Nhấn **Ctrl+C** hoặc gửi SIGTERM để yêu cầu dừng sau giao dịch đang xử lý; CLI in thống kê khi kết thúc. Nếu bị kill đột ngột, lần `generate` tiếp theo xử lý các giao dịch `PENDING` trước khi sinh thêm.
 
 Có thể dùng `python -m bank_sim` thay cho `bank-sim`. Đặt `--config` **trước** tên lệnh nếu dùng file khác:
 
@@ -81,24 +81,56 @@ Xem [config.example.toml](config.example.toml). Nếu không chỉ định file,
 | `database.schema` | `core_sim` | Schema riêng; tên chữ thường, không dùng `public` hoặc `pg_*` |
 | `seed.random_seed` | 42 | Sinh định danh khách hàng/merchant ổn định và lựa chọn workload |
 | `seed.customers` / `seed.merchants` | 100 / 20 | Mỗi chủ thể có một tài khoản |
-| `seed.opening_balance` | 100.000.000 | VND mỗi khách hàng; merchant bắt đầu từ 0 |
-| `generator.rate` | 1 | Mức yêu cầu/giây realtime; `--rate` ghi đè |
+| `seed.opening_balance` | 100.000.000 | Số dư cơ sở VND mỗi khách hàng; merchant bắt đầu từ 0 |
+| `seed.opening_balance_spread` | 0.0 | Độ phân tán số dư ban đầu, từ 0 đến 1; `0.5` sinh trong khoảng 50–150% số dư cơ sở |
+| `generator.profile` | `retail` | Phân bố bán lẻ; `uniform` chọn đều khách hàng/merchant/số tiền và chia đều thời gian lịch sử |
+| `generator.timezone` | `Asia/Ho_Chi_Minh` | Múi giờ tính nhịp mua sắm; timestamp ghi database vẫn dùng UTC |
+| `generator.rate` | 1 | Nhịp mục tiêu trung bình yêu cầu/giây realtime; `--rate` ghi đè |
+| `generator.realtime_jitter` | `true` | Dao động khoảng cách yêu cầu trong khoảng `0.5/rate` đến `1.5/rate` giây; `false` dùng `1/rate` |
 | `generator.amount_min` / `amount_max` | 10.000 / 500.000 | Khoảng tiền của thanh toán thường |
+| `generator.amount_rounding` | 1.000 | Bước làm tròn số tiền retail; vẫn giữ trong khoảng min/max |
+| `generator.local_merchant_probability` | 0.85 | Xác suất ưu tiên tập merchant cùng khu vực với khách hàng |
+| `generator.repeat_merchant_probability` | 0.6 | Xác suất chọn từ nhóm cửa hàng quen của khách hàng |
+| `generator.refund_min_age_seconds` | 300 | Khoảng cách tối thiểu giữa thanh toán và hoàn tiền theo thời gian nghiệp vụ |
+| `generator.refund_max_age_days` | 30 | Tuổi tối đa của thanh toán được generator chọn để hoàn tiền |
 | `generator.scenarios` | 90 / 3 / 3 / 2 / 2 | Trọng số normal / insufficient_funds / decline / refund / retry |
 
 Trọng số là số nguyên không âm, không bắt buộc tổng bằng 100, ít nhất một trọng số phải dương. File cấu hình và biến môi trường tách riêng; `DATABASE_URL` là nơi duy nhất nhận kết nối. Nếu cần TLS, cấu hình `sslmode` trong URL theo server của bạn.
 
-- **normal**: chọn khách hàng và merchant, trả tiền nếu đủ số dư. Khi chạy lâu và tiền khách hàng cạn, giao dịch thường cũng có thể thất bại.
-- **insufficient_funds**: số tiền bằng số dư hiện tại cộng 1 VND, vì vậy có thể vượt `amount_max`. Đây là thiếu số dư thật, không phải sửa trạng thái tùy ý.
+- **normal**: chọn khách hàng và merchant theo profile, trả tiền nếu đủ số dư. Khi chạy lâu và tiền khách hàng cạn, giao dịch thường cũng có thể thất bại.
+- **insufficient_funds**: thêm một khoản mua sắm vào số dư hiện tại rồi làm tròn lên để tạo số tiền vượt khả năng chi trả. Vì vậy số tiền có thể vượt `amount_max`. Đây là thiếu số dư thật; xử lý nghiệp vụ vẫn quyết định kết quả dựa trên số dư lúc khóa tài khoản.
 - **decline**: từ chối giả lập với mã `SIMULATED_DECLINE`, không chuyển tiền.
-- **refund**: chọn trong tối đa 1.000 thanh toán thành công chưa hoàn tiền, ưu tiên thứ tự thời gian; tạo hoàn tiền toàn phần. Nếu chưa có thanh toán phù hợp, tạo thanh toán thường.
-- **retry**: gửi lại nguyên yêu cầu trong tối đa 1.000 yêu cầu gần nhất của lần chạy; nếu chưa có, tạo thanh toán thường. Retry thất bại vẫn trả về thất bại cũ.
+- **refund**: chọn ngẫu nhiên trong tối đa 1.000 thanh toán thành công gần nhất chưa hoàn tiền và nằm trong cửa sổ tuổi cho phép; tạo hoàn tiền toàn phần. Mặc định thanh toán phải cách thời điểm hoàn tiền từ 5 phút đến 30 ngày. Nếu chưa có thanh toán phù hợp, tạo thanh toán thường. Các ngưỡng này điều khiển generator; quy tắc hoàn tiền của service vẫn kiểm tra thanh toán gốc, tài khoản, số tiền và tính duy nhất.
+- **retry**: gửi lại nguyên yêu cầu trong tối đa 1.000 yêu cầu của lần chạy, ưu tiên các yêu cầu gần đây; nếu chưa có, tạo thanh toán thường. Retry giữ nguyên `request_id` và `occurred_at`; retry thất bại vẫn trả về thất bại cũ.
 
-`--count` tính **số lần gửi yêu cầu**, gồm retry; số bản ghi mới có thể nhỏ hơn. Thống kê `succeeded`/`failed` của generator cũng tính theo lần gửi. Dùng `verify` để xem số giao dịch thực trong database. Mỗi lần `generate` có `run_id` mới và sinh workload mới; chạy lại cùng khoảng lịch sử **có tạo thêm giao dịch**.
+`--count` tính **số lần gửi yêu cầu**, gồm retry; số bản ghi mới có thể nhỏ hơn. Thống kê `succeeded`/`failed` của generator cũng tính theo lần gửi. `scenario_attempts` đếm kịch bản đã chọn, còn `fallback_payments` đếm những lần refund/retry phải chuyển sang thanh toán thường vì thiếu ứng viên. Vì vậy trọng số kịch bản không cam kết tỷ lệ trạng thái hoặc tỷ lệ hoàn tiền thực tế. Dùng `verify` để xem số giao dịch thực trong database. Mỗi lần `generate` có `run_id` mới và sinh workload mới; chạy lại cùng khoảng lịch sử **có tạo thêm giao dịch**.
 
 Giữ cùng random seed, cấu hình và trạng thái đầu để tái lập lựa chọn kịch bản/số tiền. UUID của lần sinh tải và thời gian thực không cố định. Seed khác tạo một tập chủ thể khác trong cùng schema. Giữ nguyên seed khi tiếp tục tập dữ liệu hiện tại.
 
 `seed` chạy trong một transaction; chạy lại không xóa bản ghi, không đổi số dư ban đầu/hiện tại hoặc nạp thêm tiền. Tăng số lượng sẽ thêm chủ thể; giảm số lượng không xóa chủ thể cũ. `init-db` tạo các đối tượng còn thiếu; chưa phải công cụ migration cho phiên bản schema tương lai.
+
+## Profile dữ liệu bán lẻ
+
+Profile `retail` là mặc định. Tên khách hàng được ghép từ họ và tên tiếng Việt, merchant có tên giả lập phù hợp với MCC; không lấy danh tính hoặc dữ liệu giao dịch bên ngoài. Tỷ trọng khu vực, ngành hàng, kênh QR/POS và quy mô hóa đơn là **giả định để học**, không phải số liệu thị trường Việt Nam.
+
+- Khách hàng có mức hoạt động khác nhau, merchant có mức độ phổ biến khác nhau. Một vài cửa hàng sẽ có nhiều giao dịch hơn để thực hành ranking và phân tích độ tập trung doanh thu.
+- Khách hàng thường chọn merchant cùng khu vực và quay lại nhóm cửa hàng quen. Nếu khu vực không có merchant, generator dùng toàn bộ tập merchant. Xác suất ưu tiên cùng khu vực không bằng chính xác tỷ lệ giao dịch cùng khu vực, vì chọn từ toàn bộ tập vẫn có thể gặp merchant địa phương.
+- Hóa đơn theo phân bố lệch phải: nhiều khoản nhỏ/vừa, ít khoản lớn; ngành hàng ảnh hưởng số tiền. Cùng một khoảng giới hạn, quán ăn thường có hóa đơn nhỏ hơn điện tử. Min/max vẫn được tôn trọng; muốn thấy hóa đơn điện tử lớn hơn cần tăng `amount_max`. Nếu khoảng tiền không chứa bội số của bước làm tròn, generator giữ số nguyên VND hợp lệ trong khoảng đó.
+- Lịch sử có ít giao dịch ban đêm, nhiều hơn vào các giờ mua sắm/ăn uống và trọng số cuối tuần cao hơn. Thời điểm từng yêu cầu có dao động nhưng vẫn tăng dần trong `[start, end)`; không cần giữ toàn bộ timestamp trong RAM.
+- Realtime dùng giờ thực để chọn ngành hàng và merchant, cộng dao động khoảng cách yêu cầu. `rate` không bị nhân thêm theo giờ cao điểm, nên vẫn có thể điều khiển tải khi học. Đặt `realtime_jitter = false` nếu cần nhịp cố định.
+
+File TOML cũ vẫn dùng được: các khóa chưa khai báo nhận mặc định mới. Để dùng cách chọn đều khi so sánh kết quả, thêm hoặc sửa hai khóa trong **bảng `[generator]` đã có**:
+
+```toml
+profile = "uniform"
+realtime_jitter = false
+```
+
+`uniform` chỉ thay cách chọn người mua/người bán, số tiền thanh toán thường và lịch sinh lịch sử; cửa sổ hoàn tiền cùng các quy tắc nghiệp vụ vẫn áp dụng.
+
+Mỗi chủ thể có luồng random riêng theo seed và định danh, nên tăng số khách hàng không làm thay đổi hồ sơ merchant được sinh cho cùng seed/index. UUID cũ vẫn được giữ. Sau khi cập nhật code, chạy `bank-sim init-db` để bổ sung các index phục vụ tìm giao dịch hoàn tiền và đọc incremental theo `(updated_at, id)`, rồi tiếp tục `generate` trên dữ liệu đang có.
+
+Tên và thuộc tính mới chỉ áp dụng cho **chủ thể được tạo mới**: `seed` không đổi tên/khu vực của các bản ghi đã tồn tại. Đổi `opening_balance_spread` cũng không nạp thêm tiền hay sửa số dư cũ. Nếu muốn quan sát toàn bộ hồ sơ mới từ đầu, dùng file cấu hình riêng với `database.schema` khác, chạy `init-db`, `seed`, sinh lịch sử rồi realtime. Schema bảng và các trường trong source contracts không thay đổi.
 
 ## Luồng nghiệp vụ
 
@@ -119,6 +151,8 @@ flowchart LR
 4. Trừ tiền, cộng tiền và chuyển trạng thái sang `SUCCEEDED` trong cùng transaction. Nếu không đủ số dư hoặc bị từ chối nghiệp vụ, ghi `FAILED` cùng mã lỗi, không thay đổi tiền.
 
 Lỗi kỹ thuật trong bước xử lý rollback toàn bộ thay đổi số dư và để lại `PENDING` đã lưu ở bước đầu. Cả gửi lại yêu cầu và khôi phục khi khởi động đều đi qua cùng hàm xử lý, tránh chuyển tiền hai lần.
+
+Generator dùng lại một kết nối PostgreSQL trong vòng sinh tải để giảm chi phí kết nối, nhất là qua SSH tunnel. Mỗi yêu cầu vẫn có hai database transaction riêng: commit intent `PENDING`, sau đó commit số dư và trạng thái cuối. Service chỉ nhận kết nối dùng lại khi bật autocommit và không nằm trong transaction đang mở, để intent luôn có thể được khôi phục độc lập.
 
 Phần xử lý dùng khóa `FOR NO KEY UPDATE`: số dư/trạng thái cần tuần tự hóa nhưng không đổi khóa chính. Loại khóa này tương thích với `KEY SHARE` khi PostgreSQL kiểm tra foreign key của intent mới; xem [tài liệu khóa PostgreSQL](https://www.postgresql.org/docs/16/explicit-locking.html#LOCKING-ROWS).
 
@@ -150,6 +184,8 @@ Trạng thái: `PENDING → SUCCEEDED | FAILED`. Mã lỗi nghiệp vụ: `INSUF
 
 Dữ liệu lịch sử được ghi vào PostgreSQL ở hiện tại. Khi nối CDC sau này, thời điểm WAL không trở thành thời điểm nghiệp vụ lịch sử. Nên sinh lịch sử trước rồi chạy realtime để diễn biến số dư theo thời gian dễ hiểu. Tiền ban đầu được xem là có sẵn trước thời điểm nghiệp vụ đầu tiên; đây chưa phải hệ thống snapshot số dư theo ngày.
 
+Batch polling theo `updated_at` chỉ thấy trạng thái của hàng tại lúc đọc. Nếu `PENDING` chuyển sang trạng thái cuối giữa hai lần polling, batch có thể bỏ qua phiên bản `PENDING`; profile mua sắm không tạo ra lịch sử đầy đủ các lần thay đổi. Muốn thu mọi thay đổi đã commit cần CDC hoặc bảng lịch sử sự kiện ở bước sau.
+
 ## Đối soát và truy vấn
 
 ```bash
@@ -159,7 +195,7 @@ psql "$DATABASE_URL" -f sql/examples.sql
 
 `verify` đọc một snapshot nhất quán, kiểm tra tổng số dư, đối chiếu từng tài khoản với số dư ban đầu cộng/trừ giao dịch thành công, kiểm tra hoàn tiền và đếm `PENDING`. Báo cáo chỉ liệt kê tối đa 100 tài khoản sai lệch nhưng giữ tổng số tài khoản sai. Khi generator đang chạy, snapshot có thể bắt gặp intent `PENDING` hợp lệ giữa hai bước; hãy chạy lại sau khi workload dừng để nghiệm thu.
 
-[sql/examples.sql](sql/examples.sql) có truy vấn giao dịch mới nhất, thống kê lỗi, doanh thu merchant theo phút và đối soát từng tài khoản. Các truy vấn dùng schema mặc định `core_sim`; sửa tên nếu cấu hình khác.
+[sql/examples.sql](sql/examples.sql) có truy vấn giao dịch mới nhất, thống kê lỗi, doanh thu merchant theo phút và đối soát từng tài khoản. Các truy vấn bổ sung giúp quan sát phân bố theo giờ Việt Nam, median/p90 hóa đơn theo MCC, tỷ lệ mua sắm cùng khu vực và độ trễ hoàn tiền. Các truy vấn dùng schema mặc định `core_sim`; sửa tên nếu cấu hình khác.
 
 ## Kiểm thử
 
@@ -186,9 +222,11 @@ src/bank_sim/
   schema.sql      # DDL template theo schema
   service.py      # nghiệp vụ, khóa, idempotency và recovery
   generator.py    # chọn kịch bản, history và realtime pacing
+  profiles.py     # hồ sơ giả lập, số tiền theo MCC và trọng số theo giờ
+  workload.py     # chọn khách hàng/merchant và lịch sử theo nhịp bán lẻ
   verify.py       # đối soát bằng snapshot
 tests/            # unit + integration test
 sql/examples.sql  # truy vấn học tập
 ```
 
-Một worker sinh tải; rate là mục tiêu tối đa theo thời điểm bắt đầu yêu cầu, không cam kết throughput khi database chậm. Các kiểm thử đồng thời gọi lớp nghiệp vụ bằng nhiều connection. Đây là bộ nguồn học tập, chưa có sổ cái kép, nạp/rút tiền, phí, lãi, đa tiền tệ, chuyển khoản, API/UI, CDC, Kafka, Spark hoặc Docker. Tiền khách hàng có thể cạn khi chạy lâu; muốn bắt đầu bộ dữ liệu độc lập, chọn schema mới rồi `init-db` và `seed`.
+Một worker sinh tải; rate là nhịp mục tiêu trung bình theo thời điểm bắt đầu yêu cầu, không cam kết throughput khi database chậm. Generator không phát dồn yêu cầu để bù khoảng thời gian xử lý chậm. Các kiểm thử đồng thời gọi lớp nghiệp vụ bằng nhiều connection. Đây là bộ nguồn học tập, chưa có sổ cái kép, nạp/rút tiền, phí, lãi, đa tiền tệ, chuyển khoản, API/UI, CDC, Kafka, Spark hoặc Docker. Tiền khách hàng có thể cạn khi chạy lâu; khi đó tỷ lệ `INSUFFICIENT_FUNDS` tăng tự nhiên. Muốn bắt đầu bộ dữ liệu độc lập, chọn schema mới rồi `init-db` và `seed`.

@@ -6,6 +6,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from psycopg.pq import TransactionStatus
 
 from bank_sim.service import BankingService, IdempotencyConflict, TransactionRequest
 from bank_sim.verify import verify
@@ -251,4 +252,72 @@ def test_verify_detects_per_account_corruption_even_if_total_is_preserved(db, ac
     report = verify(db)
     assert report["opening_total"] == report["current_total"]
     assert report["account_mismatch_count"] == 2
+    assert not report["ok"]
+
+
+def test_reused_connection_preserves_idempotency_and_remains_usable(db, actors):
+    service = BankingService(db)
+    request = payment(actors, 300)
+    with db.connect() as conn:
+        # A supplied connection must avoid creating additional connections.
+        with patch.object(db, "connect", side_effect=AssertionError("unexpected connection")):
+            first = service.submit(request, conn=conn)
+            assert service.submit(request, conn=conn) == first
+            with pytest.raises(IdempotencyConflict):
+                service.submit(replace(request, amount=301), conn=conn)
+            assert conn.info.transaction_status == TransactionStatus.IDLE
+            assert service.submit(payment(actors, 200), conn=conn)["status"] == "SUCCEEDED"
+        assert not conn.closed
+    assert balances(db)[actors[0]] == 500
+    assert verify(db)["ok"]
+
+
+@pytest.mark.parametrize("enclosing_transaction", [True, False])
+def test_submit_rejects_connection_that_cannot_commit_intent(db, actors, enclosing_transaction):
+    service = BankingService(db)
+    request = payment(actors)
+    with db.connect() as conn:
+        if enclosing_transaction:
+            with conn.transaction(), pytest.raises(ValueError, match="idle connection"):
+                service.submit(request, conn=conn)
+        else:
+            conn.autocommit = False
+            with pytest.raises(ValueError, match="autocommit"):
+                service.submit(request, conn=conn)
+            conn.autocommit = True
+        assert conn.execute(db.query(
+            "SELECT id FROM {schema}.transactions WHERE id = %s"
+        ), (request.id,)).fetchone() is None
+    assert verify(db)["ok"]
+
+
+def test_reused_connection_rolls_back_money_and_retains_committed_pending(db, actors):
+    service = BankingService(db)
+    request = payment(actors, 400)
+    before = balances(db)
+    with db.connect() as conn:
+        with patch.object(service, "_finish", side_effect=RuntimeError("injected settlement failure")):
+            with pytest.raises(RuntimeError):
+                service.submit(request, conn=conn)
+        assert conn.info.transaction_status == TransactionStatus.IDLE
+        # Separate connections see committed PENDING, but no movement of money.
+        assert balances(db) == before
+        report = verify(db)
+        assert report["pending"] == 1
+        assert report["account_mismatch_count"] == 0
+        assert service.submit(payment(actors, 100), conn=conn)["status"] == "SUCCEEDED"
+        assert service.submit(request, conn=conn)["status"] == "SUCCEEDED"
+        assert service.submit(request, conn=conn)["status"] == "SUCCEEDED"
+    assert balances(db)[actors[0]] == before[actors[0]] - 500
+    assert service.resume_pending() == 0
+    assert verify(db)["ok"]
+
+
+def test_verify_limits_mismatch_details_without_losing_total(db, test_config):
+    db.seed(replace(test_config, seed=replace(test_config.seed, customers=105)))
+    with db.connect() as conn:
+        conn.execute(db.query("UPDATE {schema}.accounts SET balance = balance + 1 WHERE customer_id IS NOT NULL"))
+    report = verify(db)
+    assert report["account_mismatch_count"] == 105
+    assert len(report["account_mismatches"]) == 100
     assert not report["ok"]

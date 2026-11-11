@@ -55,6 +55,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_successful_refund
     ON {schema}.transactions(original_transaction_id)
     WHERE kind = 'REFUND' AND status = 'SUCCEEDED';
 CREATE INDEX IF NOT EXISTS transactions_occurred_at ON {schema}.transactions(occurred_at);
+CREATE INDEX IF NOT EXISTS transactions_refund_candidates ON {schema}.transactions(occurred_at, id)
+    WHERE kind = 'PAYMENT' AND status = 'SUCCEEDED';
+CREATE INDEX IF NOT EXISTS transactions_updated_at ON {schema}.transactions(updated_at, id);
 CREATE INDEX IF NOT EXISTS transactions_pending ON {schema}.transactions(created_at, id) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS transactions_original ON {schema}.transactions(original_transaction_id) WHERE original_transaction_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS transactions_source ON {schema}.transactions(source_account_id) WHERE status = 'SUCCEEDED';

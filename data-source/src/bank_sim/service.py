@@ -3,6 +3,9 @@ from datetime import datetime
 from collections.abc import Callable
 from uuid import UUID, uuid5
 
+from psycopg import Connection
+from psycopg.pq import TransactionStatus
+
 from .config import positive_int
 from .db import Database
 
@@ -57,32 +60,40 @@ class BankingService:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def submit(self, request: TransactionRequest) -> dict:
+    def submit(self, request: TransactionRequest, *, conn: Connection | None = None) -> dict:
+        """Submit with an owned connection or an idle connection held by one worker."""
+        if conn is None:
+            with self.db.connect() as owned:
+                return self.submit(request, conn=owned)
+        # An enclosing transaction would turn these blocks into savepoints,
+        # preventing the PENDING intent from being committed independently.
+        if not conn.autocommit or conn.info.transaction_status != TransactionStatus.IDLE:
+            raise ValueError("submit requires an idle connection with autocommit enabled")
+
         # Persist the intent separately. A process failure in settlement leaves a
         # recoverable PENDING row, never a partially applied movement of money.
-        with self.db.connect() as conn:
-            with conn.transaction():
-                payload = request.payload()
-                conn.execute(self.db.query("""
-                    INSERT INTO {schema}.transactions (
-                        id, request_id, kind, source_account_id, destination_account_id,
-                        amount, channel, occurred_at, original_transaction_id, requested_decline
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT DO NOTHING
-                """), (request.id, request.request_id, request.kind, request.source_account_id,
-                        request.destination_account_id, request.amount, request.channel,
-                        request.occurred_at, request.original_transaction_id, request.requested_decline))
-                existing = conn.execute(self.db.query(
-                    "SELECT * FROM {schema}.transactions WHERE request_id = %s"
-                ), (request.request_id,)).fetchone()
-                # Both the primary ID (derived from request_id) and request_id
-                # are unique. Concurrent identical inserts can conflict on
-                # either index, so the INSERT handles all unique conflicts.
-                if existing is None:
-                    raise ValueError("request identifier collides with an existing transaction")
-                if any(existing[key] != value for key, value in payload.items()):
-                    raise IdempotencyConflict("request_id already exists with a different payload")
-            return self._settle(conn, existing["id"])
+        with conn.transaction():
+            payload = request.payload()
+            conn.execute(self.db.query("""
+                INSERT INTO {schema}.transactions (
+                    id, request_id, kind, source_account_id, destination_account_id,
+                    amount, channel, occurred_at, original_transaction_id, requested_decline
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """), (request.id, request.request_id, request.kind, request.source_account_id,
+                    request.destination_account_id, request.amount, request.channel,
+                    request.occurred_at, request.original_transaction_id, request.requested_decline))
+            existing = conn.execute(self.db.query(
+                "SELECT * FROM {schema}.transactions WHERE request_id = %s"
+            ), (request.request_id,)).fetchone()
+            # Both the primary ID (derived from request_id) and request_id
+            # are unique. Concurrent identical inserts can conflict on
+            # either index, so the INSERT handles all unique conflicts.
+            if existing is None:
+                raise ValueError("request identifier collides with an existing transaction")
+            if any(existing[key] != value for key, value in payload.items()):
+                raise IdempotencyConflict("request_id already exists with a different payload")
+        return self._settle(conn, existing["id"])
 
     def resume_pending(self, *, should_stop: Callable[[], bool] | None = None) -> int:
         with self.db.connect() as conn:

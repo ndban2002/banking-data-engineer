@@ -19,10 +19,11 @@ def verify(db: Database) -> dict:
                 SELECT destination_account_id, amount::numeric
                 FROM {schema}.transactions WHERE status = 'SUCCEEDED'
             ), net AS (SELECT account_id, sum(delta) AS delta FROM movements GROUP BY account_id)
-            SELECT a.id, a.balance, a.opening_balance + coalesce(net.delta, 0) AS expected_balance
+            SELECT a.id, a.balance, a.opening_balance + coalesce(net.delta, 0) AS expected_balance,
+                count(*) OVER () AS mismatch_count
             FROM {schema}.accounts a LEFT JOIN net ON net.account_id = a.id
             WHERE a.balance < 0 OR a.balance <> a.opening_balance + coalesce(net.delta, 0)
-            ORDER BY a.id
+            ORDER BY a.id LIMIT 100
         """)).fetchall()
         statuses = conn.execute(db.query("""
             SELECT kind, status, count(*) AS count, sum(amount) AS amount
@@ -54,10 +55,10 @@ def verify(db: Database) -> dict:
                    and not bad_refunds and not duplicate_refunds and not pending),
             **totals,
             "pending": pending,
-            "account_mismatch_count": len(mismatches),
+            "account_mismatch_count": int(mismatches[0]["mismatch_count"]) if mismatches else 0,
             "account_mismatches": [
                 {"id": str(row["id"]), "balance": row["balance"], "expected_balance": int(row["expected_balance"])}
-                for row in mismatches[:100]
+                for row in mismatches
             ],
             "invalid_refunds": bad_refunds,
             "duplicate_refunds": duplicate_refunds,

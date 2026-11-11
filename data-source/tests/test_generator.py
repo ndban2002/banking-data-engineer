@@ -6,15 +6,72 @@ import signal
 import subprocess
 import sys
 import time
+from uuid import uuid4
 
 import pytest
 
 from bank_sim.cli import main
 from bank_sim.config import GeneratorConfig
 from bank_sim.generator import WorkloadGenerator
+from bank_sim.service import BankingService, TransactionRequest
 from bank_sim.verify import verify
 
 pytestmark = pytest.mark.integration
+
+
+def test_refund_age_window_and_no_eligible_payment_fallback(db, test_config, actors):
+    source, destination, channel = actors
+    now = datetime(2026, 11, 1, 12, tzinfo=UTC)
+    service = BankingService(db)
+    originals = []
+    for age in (timedelta(days=31), timedelta(hours=1), timedelta(seconds=30)):
+        originals.append(service.submit(TransactionRequest(
+            uuid4(), source, destination, 10, channel, now - age)))
+    weights = {key: int(key == 'refund') for key in GeneratorConfig().scenarios}
+    config = replace(test_config, generator=GeneratorConfig(amount_min=1, amount_max=10, scenarios=weights))
+    generator = WorkloadGenerator(db, config)
+    with db.connect() as conn:
+        generator._inventory(conn)
+        generator._attempt(conn, now)
+        generator._attempt(conn, now + timedelta(seconds=1))
+        refunds = conn.execute(db.query("SELECT * FROM {schema}.transactions WHERE kind = 'REFUND'")).fetchall()
+    assert len(refunds) == 1
+    assert refunds[0]['original_transaction_id'] == originals[1]['id']
+    assert refunds[0]['status'] == 'SUCCEEDED'
+    assert generator.stats['fallback_payments'] == 1
+    assert generator.stats['scenario_attempts']['refund'] == 2
+    assert verify(db)['ok']
+
+
+def test_refund_window_near_minimum_datetime_does_not_overflow(db, test_config):
+    weights = {key: int(key == 'refund') for key in GeneratorConfig().scenarios}
+    config = replace(test_config, generator=GeneratorConfig(amount_min=1, amount_max=10, scenarios=weights))
+    generator = WorkloadGenerator(db, config)
+    with db.connect() as conn:
+        generator._inventory(conn)
+        generator._attempt(conn, datetime(1, 1, 1, tzinfo=UTC))
+        generator._attempt(conn, datetime(1, 1, 2, tzinfo=UTC))
+    assert generator.stats['attempts'] == 2
+    assert generator.stats['fallback_payments'] == 1
+    assert verify(db)['ok']
+
+
+def test_history_reuses_connection_and_retains_schema_contract(db, test_config, monkeypatch):
+    config = replace(test_config, generator=GeneratorConfig(amount_min=1, amount_max=10))
+    generator = WorkloadGenerator(db, config)
+    connect = db.connect
+    connections = []
+
+    def track():
+        connections.append(1)
+        return connect()
+
+    monkeypatch.setattr(db, 'connect', track)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    stats = generator.run(mode='history', start=now, end=now + timedelta(days=2), count=50)
+    assert len(connections) == 2  # Recovery and one workload session, independent of count.
+    assert sum(stats['scenario_attempts'].values()) == stats['attempts'] == 50
+    assert verify(db)['ok']
 
 
 def test_history_then_realtime_and_cli_verify(db, test_config, tmp_path, monkeypatch, capsys):

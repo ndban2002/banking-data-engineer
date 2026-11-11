@@ -6,11 +6,22 @@ random_seed = 42
 customers = 100
 merchants = 20
 opening_balance = 100_000_000 # VND per customer; merchants start at zero
+opening_balance_spread = 0.0 # Optional 0..1; 0.5 seeds each customer within 50..150% of base
 
 [generator]
 rate = 1.0                 # requests/second in realtime mode
 amount_min = 10_000
 amount_max = 500_000
+profile = "retail"         # retail: synthetic shopping patterns; uniform: flat sampling
+timezone = "Asia/Ho_Chi_Minh" # Business hours only; database timestamps stay UTC
+amount_rounding = 1000     # Retail tickets rounded to available 1,000 VND increments
+local_merchant_probability = 0.85
+repeat_merchant_probability = 0.6
+refund_min_age_seconds = 300 # Eligible payments must be at least five minutes old
+refund_max_age_days = 30
+realtime_jitter = true     # Vary interarrival times; false keeps fixed pacing
+
+# Retail weights/ticket sizes are illustrative synthetic assumptions, not bank statistics.
 
 # Relative weights; need not sum to 100. Each request chooses one scenario.
 # Refund/retry falls back to a normal payment if no eligible transaction exists.

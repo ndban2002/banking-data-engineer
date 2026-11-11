@@ -45,3 +45,52 @@ WHERE a.balance <> a.opening_balance + coalesce(net.delta, 0);
 SELECT sum(opening_balance) AS opening_total, sum(balance) AS current_total,
        sum(balance) - sum(opening_balance) AS difference
 FROM core_sim.accounts;
+
+-- Payment activity by local hour. Include failures, since they are also attempts
+-- to pay; idempotent retries do not create additional transaction rows.
+SELECT extract(hour FROM occurred_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::int AS local_hour,
+       count(*) AS payments,
+       count(*) FILTER (WHERE status = 'SUCCEEDED') AS successful_payments
+FROM core_sim.transactions
+WHERE kind = 'PAYMENT'
+GROUP BY local_hour
+ORDER BY local_hour;
+
+-- Ticket sizes by MCC. Successful payments avoid the deliberate oversized
+-- insufficient-funds scenario distorting the retail amount distribution.
+SELECT m.mcc, count(*) AS payments,
+       round(avg(t.amount)) AS average_vnd,
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY t.amount) AS median_vnd,
+       percentile_disc(0.9) WITHIN GROUP (ORDER BY t.amount) AS p90_vnd,
+       min(t.amount) AS minimum_vnd, max(t.amount) AS maximum_vnd
+FROM core_sim.transactions t
+JOIN core_sim.accounts a ON a.id = t.destination_account_id
+JOIN core_sim.merchants m ON m.id = a.merchant_id
+WHERE t.kind = 'PAYMENT' AND t.status = 'SUCCEEDED'
+GROUP BY m.mcc
+ORDER BY m.mcc;
+
+-- Local shopping by customer region. The result need not equal the configured
+-- local preference: the global merchant pool can also select a local merchant.
+SELECT c.region AS customer_region, count(*) AS payments,
+       count(*) FILTER (WHERE c.region = m.region) AS same_region_payments,
+       round(100.0 * count(*) FILTER (WHERE c.region = m.region)
+             / nullif(count(*), 0), 2) AS same_region_percent
+FROM core_sim.transactions t
+JOIN core_sim.accounts ca ON ca.id = t.source_account_id
+JOIN core_sim.customers c ON c.id = ca.customer_id
+JOIN core_sim.accounts ma ON ma.id = t.destination_account_id
+JOIN core_sim.merchants m ON m.id = ma.merchant_id
+WHERE t.kind = 'PAYMENT'
+GROUP BY c.region
+ORDER BY c.region;
+
+-- Refund lag uses business time. Historic rows and direct service calls can use
+-- other lags; generator age settings govern newly generated refund candidates.
+SELECT count(*) AS refunds,
+       min(r.occurred_at - p.occurred_at) AS minimum_lag,
+       percentile_disc(0.5) WITHIN GROUP (ORDER BY r.occurred_at - p.occurred_at) AS median_lag,
+       max(r.occurred_at - p.occurred_at) AS maximum_lag
+FROM core_sim.transactions r
+JOIN core_sim.transactions p ON p.id = r.original_transaction_id
+WHERE r.kind = 'REFUND' AND r.status = 'SUCCEEDED';

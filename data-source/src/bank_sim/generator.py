@@ -1,14 +1,16 @@
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import random
 import signal
 import threading
 import time
 from uuid import UUID, uuid4, uuid5
 
-from .config import Config, SCENARIOS, positive_int, positive_number
+from .config import Config, MAX_BIGINT, SCENARIOS, positive_int, positive_number
 from .db import Database
+from .profiles import payment_amount
 from .service import BankingService, TransactionRequest
+from .workload import RetailSampler, history_times
 
 
 class WorkloadGenerator:
@@ -17,37 +19,52 @@ class WorkloadGenerator:
         self.config = config
         self.service = BankingService(db)
         self.rng = random.Random(config.seed.random_seed)
+        self.clock_rng = random.Random(f'{config.seed.random_seed}:clock')
         self.recent: deque[TransactionRequest] = deque(maxlen=1000)
         self.stop = threading.Event()
         self.stats = {"run_id": str(uuid4()), "attempts": 0, "succeeded": 0,
-                      "failed": 0, "retries": 0, "recovered": 0}
+                      "failed": 0, "retries": 0, "recovered": 0,
+                      "scenario_attempts": {name: 0 for name in SCENARIOS},
+                      "fallback_payments": 0}
 
     def _inventory(self, conn) -> None:
         self.customers = conn.execute(self.db.query(
-            "SELECT id FROM {schema}.accounts WHERE customer_id IS NOT NULL ORDER BY id"
+            "SELECT a.id, c.region FROM {schema}.accounts a "
+            "JOIN {schema}.customers c ON c.id = a.customer_id ORDER BY a.id"
         )).fetchall()
         self.merchants = conn.execute(self.db.query("""
-            SELECT a.id, m.channel FROM {schema}.accounts a
+            SELECT a.id, m.channel, m.mcc, m.region FROM {schema}.accounts a
             JOIN {schema}.merchants m ON m.id = a.merchant_id ORDER BY a.id
         """)).fetchall()
         if not self.customers or not self.merchants:
             raise ValueError("no customer/merchant accounts; run init-db and seed first")
+        self.retail = RetailSampler(self.customers, self.merchants,
+                                    self.config.seed.random_seed, self.config.generator)
 
     def _request(self, conn, occurred_at: datetime) -> tuple[TransactionRequest, bool]:
         scenario = self.rng.choices(SCENARIOS, [self.config.generator.scenarios[s] for s in SCENARIOS])[0]
+        self.stats['scenario_attempts'][scenario] += 1
         if scenario == "retry" and self.recent:
-            return self.rng.choice(self.recent), True
+            # Most retries concern a recent request; retain its exact id and payload.
+            offset = min(len(self.recent) - 1, int(self.rng.expovariate(0.2)))
+            return self.recent[-1 - offset], True
         request_id = uuid5(UUID(self.stats["run_id"]), str(self.stats["attempts"]))
         if scenario == "refund":
-            candidates = conn.execute(self.db.query("""
+            available_age = occurred_at - datetime.min.replace(tzinfo=UTC)
+            minimum_age = timedelta(seconds=self.config.generator.refund_min_age_seconds)
+            maximum_age = min(available_age, timedelta(days=self.config.generator.refund_max_age_days))
+            candidates = []
+            if available_age >= minimum_age:
+                candidates = conn.execute(self.db.query("""
                 SELECT p.* FROM {schema}.transactions p
-                WHERE p.kind = 'PAYMENT' AND p.status = 'SUCCEEDED' AND p.occurred_at <= %s
+                WHERE p.kind = 'PAYMENT' AND p.status = 'SUCCEEDED'
+                    AND p.occurred_at >= %s AND p.occurred_at <= %s
                     AND NOT EXISTS (
                         SELECT 1 FROM {schema}.transactions r
                         WHERE r.original_transaction_id = p.id AND r.status = 'SUCCEEDED'
                     )
-                ORDER BY p.occurred_at, p.id LIMIT 1000
-            """), (occurred_at,)).fetchall()
+                ORDER BY p.occurred_at DESC, p.id DESC LIMIT 1000
+                """), (occurred_at - maximum_age, occurred_at - minimum_age)).fetchall()
             if candidates:
                 original = self.rng.choice(candidates)
                 return TransactionRequest(
@@ -56,13 +73,25 @@ class WorkloadGenerator:
                     kind="REFUND", original_transaction_id=original["id"],
                 ), False
 
-        source, destination = self.rng.choice(self.customers), self.rng.choice(self.merchants)
-        amount = self.rng.randint(self.config.generator.amount_min, self.config.generator.amount_max)
+        if scenario in ('refund', 'retry'):
+            self.stats['fallback_payments'] += 1
+        config = self.config.generator
+        if config.profile == 'retail':
+            source, destination = self.retail.choose(self.rng, occurred_at)
+            amount = payment_amount(self.rng, destination['mcc'], config.amount_min,
+                                    config.amount_max, config.amount_rounding)
+        else:
+            source, destination = self.rng.choice(self.customers), self.rng.choice(self.merchants)
+            amount = self.rng.randint(config.amount_min, config.amount_max)
         if scenario == "insufficient_funds":
             balance = conn.execute(self.db.query(
                 "SELECT balance FROM {schema}.accounts WHERE id = %s"
             ), (source["id"],)).fetchone()["balance"]
-            amount = balance + 1
+            if balance == MAX_BIGINT:
+                raise ValueError('cannot generate an insufficient-funds amount above BIGINT maximum')
+            # Overshoot by a shopping-sized amount rather than an artificial one VND.
+            quantum = config.amount_rounding
+            amount = min(MAX_BIGINT, ((balance + amount + quantum - 1) // quantum) * quantum)
         return TransactionRequest(
             request_id, source["id"], destination["id"], amount,
             destination["channel"], occurred_at, requested_decline=scenario == "decline",
@@ -70,7 +99,7 @@ class WorkloadGenerator:
 
     def _attempt(self, conn, occurred_at: datetime) -> None:
         request, retry = self._request(conn, occurred_at)
-        result = self.service.submit(request)
+        result = self.service.submit(request, conn=conn)
         if not retry:
             self.recent.append(request)
         self.stats["attempts"] += 1
@@ -96,7 +125,7 @@ class WorkloadGenerator:
         positive_number("rate", rate)
         if duration is not None:
             positive_number("duration", duration)
-        if mode == "history" and (end - start).total_seconds() * 1_000_000 < count:
+        if mode == "history" and (end - start) // timedelta(microseconds=1) < count:
             raise ValueError("history range must allow at least one microsecond per request")
 
         # Handlers request a graceful stop; they never interrupt the two SQL updates.
@@ -110,11 +139,13 @@ class WorkloadGenerator:
             with self.db.connect() as conn:
                 self._inventory(conn)
                 if mode == "history":
-                    interval = end - start
-                    for index in range(count):
+                    for occurred_at in history_times(
+                        start, end, count, profile=self.config.generator.profile,
+                        timezone=self.config.generator.timezone, rng=self.clock_rng,
+                    ):
                         if self.stop.is_set():
                             break
-                        self._attempt(conn, start + interval * index / count)
+                        self._attempt(conn, occurred_at)
                 else:
                     # Use monotonic time for pacing, UTC wall clock for business time.
                     epoch = time.monotonic()
@@ -125,7 +156,8 @@ class WorkloadGenerator:
                             break
                         self._attempt(conn, datetime.now(UTC))
                         # Never catch up in a burst when the DB is slower than the target rate.
-                        next_due = attempt_started + 1 / rate
+                        jitter = self.clock_rng.uniform(0.5, 1.5) if self.config.generator.realtime_jitter else 1
+                        next_due = attempt_started + jitter / rate
                         if deadline is not None:
                             next_due = min(next_due, deadline)
                         self.stop.wait(max(0.0, next_due - time.monotonic()))
