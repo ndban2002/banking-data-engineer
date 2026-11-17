@@ -1,6 +1,6 @@
 # Batch infrastructure: MinIO + Spark + Iceberg
 
-Stack local gồm MinIO lưu object, Iceberg REST catalog lưu thông tin bảng bằng SQLite, Spark 3.5.6 standalone master/worker và các job JDBC nạp bốn bảng simulator vào Bronze. Image Spark có Python, Iceberg 1.9.2, AWS S3 FileIO và PostgreSQL JDBC driver.
+Stack local gồm MinIO lưu object, Iceberg REST catalog lưu thông tin bảng bằng SQLite, Spark 3.5.6 standalone master/worker, các job JDBC nạp bốn bảng simulator vào Bronze và các job Silver current state/quality. Image Spark có Python, Iceberg 1.9.2, AWS S3 FileIO và PostgreSQL JDBC driver.
 
 Dữ liệu MinIO nằm trong volume `minio-data`; SQLite catalog nằm trong `iceberg-catalog`. Các cổng publish bind vào `127.0.0.1`. Đây là môi trường học local; thông tin kết nối PostgreSQL và credentials MinIO cấu hình trong `.env` được Git bỏ qua.
 
@@ -37,7 +37,7 @@ Script dùng bảng riêng `lakehouse.bronze._infra_smoke_test`, tạo bảng n�
 
 Bốn entrypoint dùng chung [bronze_loader.py](jobs/bronze_loader.py) cho JDBC, metadata, ghi Iceberg, manifest và watermark. Source-to-target mapping trong [contracts/mappings/postgresql](../../contracts/mappings/postgresql/) vẫn là đặc tả thiết kế; job chưa đọc YAML để tự sinh phép biến đổi.
 
-`customers` và `merchants` không có `updated_at`, nên job mặc định `--mode full` và từ chối `--mode incremental`. Không dùng `created_at` làm watermark vì sẽ bỏ sót thay đổi thuộc tính của bản ghi cũ. Việc so sánh snapshot, SCD2 và phát hiện xóa sẽ được triển khai ở Silver.
+`customers` và `merchants` không có `updated_at`, nên job mặc định `--mode full` và từ chối `--mode incremental`. Không dùng `created_at` làm watermark vì sẽ bỏ sót thay đổi thuộc tính của bản ghi cũ. Silver current state so sánh theo thời gian quan sát; SCD2 và phát hiện xóa chưa được triển khai.
 
 `accounts` và `transactions` hỗ trợ `--mode full` hoặc `--mode incremental` (mặc định). Khi chưa có watermark, incremental đọc toàn bộ nguồn; sau đó lọc `updated_at >= watermark - overlap`. Overlap mặc định là 5 phút, có thể thay bằng `--overlap-minutes`.
 
@@ -134,6 +134,73 @@ Nếu bảng Bronze bị xóa nhưng watermark còn, incremental sẽ dừng đ�
 
 Manifest mới chỉ chứng nhận các batch do loader mới ghi; dữ liệu transactions cũ chưa có manifest sẽ không được coi là batch đã chấp nhận. Lần full đầu tiên lấy trạng thái hiện tại của nguồn, không tạo lại lịch sử quan sát đã có từ trước.
 
+## Silver current state
+
+[silver_loader.py](jobs/silver_loader.py) đọc các batch có manifest từ Bronze và ghi bốn bảng Iceberg. Job không kết nối lại PostgreSQL. Chạy sau khi Bronze đã có ít nhất một batch được chấp nhận cho mỗi bảng:
+
+```bash
+docker compose exec -T spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/spark/work-dir/jobs/silver_loader.py \
+  --table all --bronze-namespace bronze --silver-namespace silver
+```
+
+| Nguồn Bronze | Bảng Silver | Khóa | Phiên bản được giữ |
+| --- | --- | --- | --- |
+| `customers` | `lakehouse.silver.dim_customers` | `customer_id` | Thời gian quan sát batch mới hơn |
+| `merchants` | `lakehouse.silver.dim_merchants` | `merchant_id` | Thời gian quan sát batch mới hơn |
+| `accounts` | `lakehouse.silver.dim_accounts` | `account_id` | `updated_at` mới hơn |
+| `transactions` | `lakehouse.silver.fact_transactions` | `transaction_id` | `updated_at` mới hơn |
+
+Tên được trim, region được trim/uppercase, UUID chuyển lowercase. Tiền VND dùng `BIGINT`; `occurred_at` vẫn là thời gian nghiệp vụ. Giao dịch `PENDING` và `FAILED` hợp lệ vẫn được giữ; lỗi nghiệp vụ `INVALID_REFUND` không tự biến một dòng thành dữ liệu hỏng. Kiểm tra schema từ chối kiểu tiền float/decimal hoặc timestamp bị đổi kiểu, thay vì ép kiểu làm mất dữ liệu.
+
+Mỗi batch được đọc từ đúng snapshot Iceberg ghi trong manifest, lọc `_batch_id` và kiểm tra provenance/số dòng. Batch chưa có manifest bị bỏ qua. Hai quan sát cùng khóa, cùng phiên bản nhưng khác nội dung bị quarantine; batch cũ không được ghi đè phiên bản mới. `request_id` phải duy nhất giữa các transaction và không được đổi cho transaction đã có.
+
+Các bảng điều khiển:
+
+- `lakehouse.silver._quarantine`: dòng không hợp lệ, JSON gốc, mã lỗi, batch và snapshot nguồn; ID ổn định giúp replay không nhân đôi lỗi.
+- `lakehouse.silver._processed_batches`: checkpoint processing riêng với watermark Bronze, kèm fingerprint manifest, số dòng đầu vào/upsert/quarantine. `upsert_rows` là số dòng ghi trong lần xử lý đó, không phải tổng số dòng hợp lệ của nguồn.
+
+Thứ tự commit là **Silver → quarantine → checkpoint**. Nếu ghi lỗi giữa chừng, chạy lại sẽ xử lý batch chưa có checkpoint và merge theo khóa. Batch có lỗi DQ vẫn được đánh dấu đã xử lý sau khi quarantine đã lưu. CLI trả mã `1` nếu có dòng bị quarantine trong batch xử lý ở lần chạy này; batch lịch sử được skip vẫn xuất trong báo cáo nhưng không làm lần chạy mới thất bại. Mã `0` không thay thế việc xem quarantine và chạy quality gate trước Gold.
+
+Chạy lại mặc định chỉ xử lý batch chưa hoàn thành. Để kiểm tra replay một batch đã xử lý:
+
+```bash
+docker compose exec -T spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/spark/work-dir/jobs/silver_loader.py \
+  --table transactions --batch-id '<batch_id_trong_manifest>' --replay
+```
+
+Chạy **một writer tại một thời điểm cho cả namespace Silver**; chưa có khóa điều phối. Mỗi Silver namespace gắn với một Bronze namespace và một dataset nguồn. Không chỉnh trực tiếp các bảng Silver/control; để rebuild hoặc đổi quy tắc xử lý, dùng namespace Silver mới và giữ đủ snapshot Bronze cần replay. Snapshot đã hết hạn khiến job dừng, không tự đọc dữ liệu hiện tại để thay thế.
+
+Đây là **current state**: chưa có SCD2, chưa suy ra hard delete từ dòng vắng mặt trong full snapshot. Snapshot rỗng không xóa trạng thái đang có. Các commit trên bảng khác nhau không phải một transaction chung; downstream chỉ sử dụng kết quả sau khi hoàn tất nạp và kiểm tra chất lượng.
+
+## Quality gate Silver
+
+Sau khi dừng simulator, hoàn tất full/reconciliation Bronze và nạp đủ bốn bảng Silver, chạy:
+
+```bash
+docker compose exec -T spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/spark/work-dir/jobs/silver_quality.py --namespace silver
+```
+
+Gate chỉ đọc và cố định snapshot của từng bảng trong báo cáo: kiểm tra uniqueness, chủ sở hữu tài khoản, foreign key, hướng payment/refund thành công, một refund thành công cho mỗi payment và **đối soát số dư từng tài khoản** từ opening balance cộng/trừ giao dịch thành công. Cộng dồn dùng `DECIMAL(38,0)` để tránh tràn `BIGINT`. Có vi phạm thì trả mã `1`; bảng thiếu hoặc binding sai cũng làm job thất bại.
+
+Kiểm tra liên bảng chạy riêng vì bốn lần JDBC không dùng chung snapshot nguồn. Gate không chứng minh được shared source cutoff, không xác minh channel lịch sử của merchant từ dimension hiện tại, và không tự phê duyệt lỗi quarantine lịch sử; các giới hạn này có trong `not_checked` của báo cáo. `PENDING` được đếm riêng để người chạy quyết định nguồn đã ổn định hay chưa.
+
+Xem các batch lỗi và nguyên nhân trong Spark SQL:
+
+```sql
+SELECT bronze_table, batch_id, input_rows, upsert_rows, quarantined_rows
+FROM lakehouse.silver._processed_batches
+ORDER BY processed_at DESC;
+
+SELECT source_table, batch_id, record_id, reason_codes
+FROM lakehouse.silver._quarantine;
+```
+
 ## Kiểm thử code và nghiệm thu runtime
 
 Từ root repo, với Python 3.10+ và pytest đã cài:
@@ -142,7 +209,16 @@ Từ root repo, với Python 3.10+ và pytest đã cài:
 python -m pytest batch/infra/tests -q
 ```
 
-Bộ test kiểm tra chiến lược từng bảng, SQL incremental/UTC, định danh nguồn và thứ tự append → kiểm tra dữ liệu đã ghi → manifest → watermark, kể cả lỗi ghi hoặc snapshot rỗng. Các kiểm thử vòng đời dùng đối tượng Spark giả, không thay thế nghiệm thu JDBC/Iceberg. Docker daemon không chạy trong môi trường sửa code này nên chưa kiểm chứng runtime các job mới.
+Bộ test nhanh kiểm tra Bronze lifecycle, manifest/fingerprint Silver, schema và các quy tắc đối soát. Test runtime Silver mặc định được skip trong pytest; chạy riêng trên Spark/Iceberg thật bằng lệnh sau (từ `batch/infra/`):
+
+```bash
+docker compose exec -T spark-master sh -c 'cat > /tmp/test_silver_runtime.py' \
+  < tests/test_silver_runtime.py
+docker compose exec -T spark-master /opt/spark/bin/spark-submit \
+  --master 'local[2]' /tmp/test_silver_runtime.py
+```
+
+Script tạo namespace riêng `silver_test_b_<uuid>` và `silver_test_s_<uuid>`, dùng dữ liệu tổng hợp rồi xóa đúng các bảng/namespace do test tạo. Không đọc PostgreSQL hoặc bảng nghiệp vụ hiện có. Các ca kiểm thử gồm accepted manifest, replay không lùi trạng thái, quarantine không trùng, snapshot rỗng, conflict cùng phiên bản, request ID trùng, thiếu snapshot, sai nguồn, lỗi trước checkpoint và quality gate bốn bảng. Đây là kiểm chứng Silver trên Iceberg; nghiệm thu JDBC từ nguồn thực vẫn cần quy trình bên dưới.
 
 Khi stack chạy, dùng namespace thử nghiệm và chạy tuần tự: full bốn bảng → kiểm tra manifest/số dòng → sửa tên merchant hoặc region customer → full lại hai dimension → sinh giao dịch simulator → incremental accounts/transactions. Chạy lại để quan sát overlap, kiểm tra số dư VND vẫn là `BIGINT`, các trường chủ tài khoản null vẫn được giữ, và watermark riêng cho từng bảng. Dừng simulator trong lúc đối soát liên bảng. Với snapshot rỗng, dùng một schema nguồn thử nghiệm đầy đủ DDL nhưng chưa seed; không xóa dữ liệu đang dùng để thử.
 

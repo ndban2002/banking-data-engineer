@@ -25,6 +25,8 @@ Tài liệu data model và chiến lược ingestion ở [DATA_MODELING_AND_INGE
 
 Mapping v2 làm rõ phạm vi uniqueness, giữ giao dịch FAILED hợp lệ, tách checkpoint ingestion/processing và giới hạn của polling/SCD2. Đây là specification, chưa có runner đọc YAML để thực thi các quy tắc. Mục tiêu Silver SCD2 được triển khai sau khi current-state pipeline đã đúng.
 
+Baseline hiện được triển khai trong [silver_loader.py](../batch/infra/jobs/silver_loader.py) và [silver_transform.py](../batch/infra/jobs/silver_transform.py): một dòng hiện tại cho mỗi business key, chưa có surrogate key hoặc cột hiệu lực SCD2. Customers/merchants lấy phiên bản theo thời gian quan sát batch; accounts/transactions lấy theo `updated_at`. Các kiểm tra tham chiếu và đối soát liên bảng chạy riêng bằng [silver_quality.py](../batch/infra/jobs/silver_quality.py), sau khi đã nạp đầy đủ bốn bảng tại mốc nguồn ổn định. Xem [hướng dẫn Silver](../batch/infra/README.md#silver-current-state) cho cách chạy và giới hạn.
+
 Contract nguồn mô tả cấu trúc và ý nghĩa dữ liệu mà pipeline có thể kỳ vọng. DDL thực tế của simulator nằm trong [schema.sql](../data-source/src/bank_sim/schema.sql); khi thay đổi cấu trúc nguồn, cập nhật contract tương ứng.
 
 ## Contract `accounts`
