@@ -2,9 +2,9 @@
 
 Thư mục dành cho phase batch lakehouse. Hạ tầng local MinIO + Spark + Iceberg REST và các job nạp `customers`, `merchants`, `accounts`, `transactions` từ PostgreSQL vào Bronze nằm trong [infra](infra/README.md).
 
-Luồng: PostgreSQL nguồn từ [simulator](../data-source/README.md) → Spark batch → Bronze → Silver current state trên MinIO và Apache Iceberg. SCD2 và Gold là các bước tiếp theo.
+Luồng: PostgreSQL nguồn từ [simulator](../data-source/README.md) → Spark batch → Bronze → Silver current state → Gold daily merchant trên MinIO và Apache Iceberg.
 
-Hiện có loader JDBC dùng chung cho bốn bảng: customers/merchants đọc full snapshot mỗi lần; accounts/transactions hỗ trợ full rồi incremental theo `updated_at`. Mỗi batch append vào Iceberg, thêm metadata, ghi manifest và chỉ cập nhật watermark sau khi dữ liệu cùng manifest đã lưu thành công. Silver chỉ đọc batch có manifest, chuẩn hóa và dedup vào `dim_customers`, `dim_merchants`, `dim_accounts`, `fact_transactions`; có quarantine, checkpoint riêng và quality gate đối soát từng tài khoản. Chưa có SCD2, Gold hoặc orchestrator. Xem [hướng dẫn chạy và giới hạn](infra/README.md) trước khi nghiệm thu pipeline.
+Hiện có loader JDBC dùng chung cho bốn bảng: customers/merchants đọc full snapshot mỗi lần; accounts/transactions hỗ trợ full rồi incremental theo `updated_at`. Mỗi batch append vào Iceberg, thêm metadata, ghi manifest và chỉ cập nhật watermark sau khi dữ liệu cùng manifest đã lưu thành công. Silver chỉ đọc batch có manifest, chuẩn hóa và dedup vào `dim_customers`, `dim_merchants`, `dim_accounts`, `fact_transactions`; có quarantine, checkpoint riêng và quality gate đối soát từng tài khoản. Gold tính payment/refund/net theo merchant và ngày Việt Nam, kèm số đếm FAILED/PENDING; full rebuild xử lý late correction và replay. Chưa có SCD2 hoặc orchestrator. Xem [hướng dẫn chạy Gold và giới hạn](infra/README.md#gold--daily-merchant-performance) trước khi nghiệm thu pipeline.
 
 Hướng triển khai: Spark jobs chạy độc lập → Silver current state và một Gold mart có đối soát → **Dagster OSS assets**, quality gates, retry và backfill → **ClickHouse analytics → Grafana**. Dagster gọi Spark jobs; Bronze/Silver/Gold vẫn nằm trong Iceberg. Mỗi bảng chỉ có một pipeline chịu trách nhiệm ghi. Trino và dbt là các bài mở rộng tùy chọn.
 

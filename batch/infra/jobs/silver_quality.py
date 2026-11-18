@@ -102,13 +102,19 @@ def quality_queries(views: dict[str, str]) -> dict[str, str]:
     return queries
 
 
-def check_silver(spark, namespace: str = "silver") -> dict:
+def check_silver(spark, namespace: str = "silver", *, snapshots: dict | None = None) -> dict:
     """Check one dataset, returning counts and the exact snapshots inspected.
 
     Missing tables, absent source bindings and unreadable snapshots raise rather
-    than returning a misleading successful partial report.
+    than returning a misleading successful partial report. Gold supplies an
+    explicit snapshot map to validate exactly the same inputs it will consume.
     """
     identifier(namespace)
+    requested = snapshots
+    if requested is not None and set(requested) != {
+        f"lakehouse.{namespace}.{name}" for name, _ in TABLES.values()
+    }:
+        raise ValueError("snapshot map must identify exactly the four Silver tables")
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     # Overflow must fail the report instead of producing NULL in monetary sums.
     original_ansi = spark.conf.get("spark.sql.ansi.enabled")
@@ -136,7 +142,8 @@ def check_silver(spark, namespace: str = "silver") -> dict:
             expected_key = json.dumps([*dataset, source], separators=(",", ":"))
             if properties.get("silver.source_key") != expected_key:
                 raise ValueError(f"Silver source table binding does not match: {target}")
-            snapshot = current_snapshot_id(spark, target)
+            snapshot = (requested[target] if requested is not None
+                        else current_snapshot_id(spark, target))
             snapshots[target] = snapshot
             frame = (spark.read.option("snapshot-id", str(snapshot)).table(target)
                      if snapshot is not None else spark.table(target).limit(0))

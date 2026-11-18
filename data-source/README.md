@@ -197,6 +197,8 @@ psql "$DATABASE_URL" -f sql/examples.sql
 
 [sql/examples.sql](sql/examples.sql) có truy vấn giao dịch mới nhất, thống kê lỗi, doanh thu merchant theo phút và đối soát từng tài khoản. Các truy vấn bổ sung giúp quan sát phân bố theo giờ Việt Nam, median/p90 hóa đơn theo MCC, tỷ lệ mua sắm cùng khu vực và độ trễ hoàn tiền. Các truy vấn dùng schema mặc định `core_sim`; sửa tên nếu cấu hình khác.
 
+[sql/daily_merchant_baseline.sql](sql/daily_merchant_baseline.sql) tính metric merchant/ngày tương ứng với Gold: payment/refund thành công, net và số đếm FAILED/PENDING. Dùng truy vấn read-only này khi đối chiếu nguồn đã dừng workload với Gold cùng cutoff; ngày lấy theo giờ Việt Nam và refund ghi ngày refund.
+
 ## Kiểm thử
 
 ```bash

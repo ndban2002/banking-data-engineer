@@ -201,6 +201,89 @@ SELECT source_table, batch_id, record_id, reason_codes
 FROM lakehouse.silver._quarantine;
 ```
 
+## Gold — daily merchant performance
+
+[gold_daily_merchant.py](jobs/gold_daily_merchant.py) tạo bảng
+`lakehouse.gold.daily_merchant_performance`, grain **merchant × ngày nghiệp vụ Việt Nam**.
+Chạy từ `batch/infra/`, sau khi hoàn tất Silver; dừng simulator khi reconciliation
+và không chạy Silver writer đồng thời với Gold:
+
+```bash
+docker compose exec -T spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/spark/work-dir/jobs/gold_daily_merchant.py \
+  --silver-namespace silver --gold-namespace gold
+```
+
+Job cố định snapshot của bốn bảng Silver, chạy 16 kiểm tra chất lượng trên **đúng
+các snapshot đó**, kiểm tra binding và checkpoint processing trước khi tính mart.
+Quarantine Silver phải rỗng; lỗi lịch sử cũng chặn Gold trong baseline này. Sau khi
+sửa quy tắc/nguồn, rebuild Silver trong namespace mới để giữ nguyên audit cũ rồi
+chạy Gold với namespace mới tương ứng. Không xóa lỗi audit để vượt gate.
+Dòng Silver đã ghi nhưng chưa có checkpoint cũng chặn Gold: retry Silver trước.
+
+| Cột | Định nghĩa |
+| --- | --- |
+| `business_date` | DATE của `occurred_at` theo `Asia/Ho_Chi_Minh`, không dùng ngày ingest |
+| `merchant_id` | PAYMENT: merchant của destination account; REFUND: merchant của source account |
+| `payment_count`, `payment_amount_vnd` | Số transaction / tổng VND PAYMENT SUCCEEDED |
+| `refund_count`, `refund_amount_vnd` | Số transaction / tổng VND REFUND SUCCEEDED, ghi ngày refund |
+| `net_amount_vnd` | Payment amount trừ refund amount; có thể âm khi ngày chỉ có refund |
+| `failed_payment_count`, `failed_refund_count` | Số transaction FAILED, không cộng tiền |
+| `pending_payment_count`, `pending_refund_count` | Số transaction PENDING, không cộng tiền |
+| `transaction_count` | Tổng số transaction mọi trạng thái của merchant/ngày |
+| `_input_id`, `_source_snapshots` | Fingerprint và snapshot Silver đầu vào để tái hiện |
+
+Silver bảo đảm transaction ID duy nhất; counts đo transaction, không đo lần gọi
+retry request. Các tổng tiền là `DECIMAL(38,0)` để tổng vượt giới hạn BIGINT vẫn
+chính xác; overflow làm job thất bại. Merchant không có hoạt động không sinh dòng
+0. Chưa join tên/MCC/region vào mart để tránh thể hiện thuộc tính hiện tại như lịch
+sử; có thể join dimension hiện tại khi hiển thị, với ý nghĩa được ghi rõ.
+
+Một request FAILED/PENDING có thể sai hướng tài khoản nên không gán được merchant
+theo quy tắc trên. Các dòng này vào bucket `merchant_id='__unattributed__'` theo
+ngày thay vì bị inner join loại mất. Transaction SUCCEEDED không gán được merchant
+làm job thất bại. Quality pass chưa chứng minh shared source cutoff; PENDING vẫn
+được báo riêng và không tự chặn Gold.
+
+**Baseline dùng full recompute**, chưa tối ưu chỉ xử lý ngày thay đổi. Mỗi lần
+đọc lại toàn bộ fact current state, tính lại mọi merchant/ngày, đối chiếu với một
+SQL aggregation riêng trên cùng input, rồi ghi toàn bộ mart bằng một Iceberg
+overwrite. Vì vậy late arrival, thay đổi trạng thái/ngày, và nhóm cũ biến mất đều
+được sửa; replay không cộng thêm tiền. Bảng partition theo `business_date`, nhưng
+job không chỉ overwrite partition “hôm nay”. Giới hạn là chi phí scan toàn lịch sử;
+bài tiếp theo mới tối ưu affected dates sau khi có thay đổi nguồn đáng tin cậy.
+[Iceberg mô tả overwrite là thao tác nguyên tử trên bảng](https://iceberg.apache.org/docs/1.9.2/spark-writes/).
+
+Sau ghi, job đọc lại đúng snapshot output và so với dữ liệu đã kiểm tra, rồi ghi
+`lakehouse.gold._materializations`: run ID, input fingerprint, snapshot nguồn,
+snapshot output, số dòng và tổng đối soát. Một writer cho mỗi Gold namespace.
+Mart và ledger là **hai commit riêng**; nếu crash sau overwrite, dữ liệu mới có
+thể đã thấy được nhưng chưa có run hoàn thành. Retry sẽ rebuild, không append
+delta. Mỗi lần chạy thành công có một dòng ledger; cùng input có cùng `_input_id`.
+Downstream publish dùng `output_snapshot_id` của run hoàn thành, không mặc định
+snapshot mới nhất của mart là bản đã được ghi nhận trong ledger. Giữ các snapshot
+cần dùng; chưa tự động hóa retention hoặc ClickHouse publication.
+
+Ví dụ Spark SQL:
+
+```sql
+SELECT business_date, merchant_id, payment_count, refund_count,
+       payment_amount_vnd, refund_amount_vnd, net_amount_vnd,
+       failed_payment_count, failed_refund_count
+FROM lakehouse.gold.daily_merchant_performance
+ORDER BY business_date DESC, merchant_id;
+
+SELECT run_id, input_id, row_count, output_snapshot_id, reconciliation
+FROM lakehouse.gold._materializations
+ORDER BY completed_at DESC;
+```
+
+Để đối chiếu PostgreSQL cùng cutoff, dùng SQL read-only
+[daily_merchant_baseline.sql](../../data-source/sql/daily_merchant_baseline.sql).
+Runtime test dùng fixture độc lập; nó không thay thế đối chiếu nguồn PostgreSQL
+đang dùng, và job Gold không tự kết nối PostgreSQL.
+
 ## Kiểm thử code và nghiệm thu runtime
 
 Từ root repo, với Python 3.10+ và pytest đã cài:
@@ -219,6 +302,24 @@ docker compose exec -T spark-master /opt/spark/bin/spark-submit \
 ```
 
 Script tạo namespace riêng `silver_test_b_<uuid>` và `silver_test_s_<uuid>`, dùng dữ liệu tổng hợp rồi xóa đúng các bảng/namespace do test tạo. Không đọc PostgreSQL hoặc bảng nghiệp vụ hiện có. Các ca kiểm thử gồm accepted manifest, replay không lùi trạng thái, quarantine không trùng, snapshot rỗng, conflict cùng phiên bản, request ID trùng, thiếu snapshot, sai nguồn, lỗi trước checkpoint và quality gate bốn bảng. Đây là kiểm chứng Silver trên Iceberg; nghiệm thu JDBC từ nguồn thực vẫn cần quy trình bên dưới.
+
+Test Gold dùng cùng fixture Bronze/Silver và namespace `gold_test_<uuid>` riêng.
+Copy cả hai file vào cùng thư mục container rồi chạy:
+
+```bash
+docker compose exec -T spark-master sh -c 'cat > /tmp/test_silver_runtime.py' \
+  < tests/test_silver_runtime.py
+docker compose exec -T spark-master sh -c 'cat > /tmp/test_gold_runtime.py' \
+  < tests/test_gold_runtime.py
+docker compose exec -T spark-master /opt/spark/bin/spark-submit \
+  --master 'local[2]' /tmp/test_gold_runtime.py
+```
+
+Các ca kiểm thử Gold có expected metric cụ thể: UTC sát nửa đêm Việt Nam,
+payment ngày D/refund ngày D+1, FAILED/PENDING, unknown merchant, replay,
+late arrival, nhóm ngày cũ biến mất, gate chặn publication, snapshot input cố
+định, crash trước ledger, tổng tiền vượt BIGINT và empty input xóa các nhóm cũ. Test dọn đúng namespace
+do nó tạo; không ghi vào dataset đang dùng.
 
 Khi stack chạy, dùng namespace thử nghiệm và chạy tuần tự: full bốn bảng → kiểm tra manifest/số dòng → sửa tên merchant hoặc region customer → full lại hai dimension → sinh giao dịch simulator → incremental accounts/transactions. Chạy lại để quan sát overlap, kiểm tra số dư VND vẫn là `BIGINT`, các trường chủ tài khoản null vẫn được giữ, và watermark riêng cho từng bảng. Dừng simulator trong lúc đối soát liên bảng. Với snapshot rỗng, dùng một schema nguồn thử nghiệm đầy đủ DDL nhưng chưa seed; không xóa dữ liệu đang dùng để thử.
 
