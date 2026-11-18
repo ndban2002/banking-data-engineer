@@ -284,6 +284,91 @@ ORDER BY completed_at DESC;
 Runtime test dùng fixture độc lập; nó không thay thế đối chiếu nguồn PostgreSQL
 đang dùng, và job Gold không tự kết nối PostgreSQL.
 
+## Gold — tổng quan ngày và xếp hạng tháng
+
+[gold_rollups.py](jobs/gold_rollups.py) đọc snapshot `daily_merchant_performance`
+của lần chạy hoàn thành mới nhất trong `gold._materializations`. Hai bảng dùng
+cùng snapshot và cộng lại các metric VND nguyên từ bảng merchant/ngày.
+
+| Bảng | Grain | Dùng cho |
+| --- | --- | --- |
+| `gold.daily_platform_performance` | Một dòng mỗi ngày nghiệp vụ Việt Nam | KPI toàn hệ thống, số merchant có payment thành công, số giao dịch chưa gán merchant |
+| `gold.monthly_merchant_performance` | Một dòng mỗi merchant và tháng nghiệp vụ Việt Nam | Xu hướng tháng, số ngày có payment thành công, xếp hạng theo net |
+
+Tổng quan ngày giữ giao dịch thuộc bucket `__unattributed__` để tổng số giao dịch
+khớp đầu vào. Bảng tháng chỉ có merchant đã xác định. `business_month` là ngày đầu
+tháng. `net_rank` tính bằng `DENSE_RANK` trong từng tháng theo net VND giảm dần.
+Merchant có cùng net cùng hạng. Merchant chỉ có FAILED/PENDING vẫn có dòng
+chỉ số với hạng NULL. Một merchant chỉ có refund thành công vẫn được xếp hạng.
+
+Cả hai bảng tính `payment_success_rate_pct` từ tổng số đếm của nhóm:
+`100 × payment_count / (payment_count + failed_payment_count)`.
+PENDING được theo dõi bằng số đếm riêng. Tỷ lệ là NULL khi chưa có payment kết
+thúc. Tính lại tỷ lệ từ hai số đếm khi lên grain lớn hơn.
+
+Từ `batch/infra/`, sau khi chạy daily Gold:
+
+```bash
+docker compose exec -T spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/spark/work-dir/jobs/gold_rollups.py --gold-namespace gold
+```
+
+Job kiểm tra số dòng, fingerprint, grain và tổng metric của daily snapshot
+so với ledger. Sau khi đối chiếu tổng của cả hai mart, job ghi thay thế toàn bộ
+từng bảng, đọc lại snapshot vừa ghi và ghi run vào cùng ledger. Cả hai output
+lưu `_source_snapshot_id` và `_input_id` để đối chiếu phiên bản.
+Hai bảng có commit riêng. Nếu một lần chạy dừng giữa hai bảng, retry sẽ tính
+lại từ snapshot daily đã hoàn thành mà job chọn ở lần chạy lại. Chạy các job
+Gold tuần tự cho mỗi namespace.
+
+```sql
+SELECT business_date, transaction_count, active_merchant_count,
+       payment_success_rate_pct, net_amount_vnd
+FROM lakehouse.gold.daily_platform_performance
+ORDER BY business_date DESC;
+
+SELECT business_month, merchant_id, net_rank, net_amount_vnd
+FROM lakehouse.gold.monthly_merchant_performance
+WHERE net_rank <= 10
+ORDER BY business_month DESC, net_rank, merchant_id;
+```
+
+## Gold — top 10 giao dịch theo tháng
+
+[gold_monthly_top_transactions.py](jobs/gold_monthly_top_transactions.py) tạo
+`lakehouse.gold.monthly_top_transactions`. Mỗi dòng là một giao dịch trong top
+10 toàn hệ thống của tháng nghiệp vụ Việt Nam. Tháng có ít hơn 10 giao dịch đủ
+điều kiện sẽ có ít hơn 10 dòng.
+
+- Xếp PAYMENT và REFUND `SUCCEEDED` chung theo `amount_vnd` giảm dần. Refund
+  dùng số tiền dương gốc để thể hiện độ lớn của giao dịch.
+- `business_month` là ngày đầu tháng của `occurred_at` theo múi giờ Việt Nam.
+- Khi bằng tiền, ưu tiên `occurred_at` sớm hơn rồi đến `transaction_id` tăng dần.
+  `ROW_NUMBER` bảo đảm mỗi tháng có tối đa 10 hạng khác nhau.
+
+Job lấy snapshot Silver của facts và accounts từ lần daily Gold đã hoàn thành
+gần nhất vì daily Gold đã gộp mất chi tiết từng giao dịch. Job kiểm tra số lượng
+và tổng tiền PAYMENT/REFUND thành công khớp với ledger của lần daily Gold đó.
+Bảng được tính lại toàn bộ và thay thế trong một Iceberg commit. Ledger lưu lần
+chạy hoàn thành sau khi đọc lại snapshot và đối chiếu kết quả vừa ghi.
+
+Chạy từ `batch/infra/` sau khi đã có daily Gold:
+
+```bash
+docker compose exec -T spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/spark/work-dir/jobs/gold_monthly_top_transactions.py --gold-namespace gold
+```
+
+```sql
+SELECT business_month, transaction_rank, transaction_id, transaction_type,
+       merchant_id, business_date, occurred_at, amount_vnd
+FROM lakehouse.gold.monthly_top_transactions
+WHERE business_month = DATE '2026-11-01'
+ORDER BY transaction_rank;
+```
+
 ## Kiểm thử code và nghiệm thu runtime
 
 Từ root repo, với Python 3.10+ và pytest đã cài:
@@ -320,6 +405,16 @@ payment ngày D/refund ngày D+1, FAILED/PENDING, unknown merchant, replay,
 late arrival, nhóm ngày cũ biến mất, gate chặn publication, snapshot input cố
 định, crash trước ledger, tổng tiền vượt BIGINT và empty input xóa các nhóm cũ. Test dọn đúng namespace
 do nó tạo; không ghi vào dataset đang dùng.
+
+Kiểm thử rollups dùng script riêng để kiểm tra tỷ lệ, đồng hạng, replay và
+chọn đúng snapshot đã hoàn thành:
+
+```bash
+docker compose exec -T spark-master sh -c 'cat > /tmp/test_gold_rollups_runtime.py' \
+  < tests/test_gold_rollups_runtime.py
+docker compose exec -T spark-master /opt/spark/bin/spark-submit \
+  --master 'local[2]' /tmp/test_gold_rollups_runtime.py
+```
 
 Khi stack chạy, dùng namespace thử nghiệm và chạy tuần tự: full bốn bảng → kiểm tra manifest/số dòng → sửa tên merchant hoặc region customer → full lại hai dimension → sinh giao dịch simulator → incremental accounts/transactions. Chạy lại để quan sát overlap, kiểm tra số dư VND vẫn là `BIGINT`, các trường chủ tài khoản null vẫn được giữ, và watermark riêng cho từng bảng. Dừng simulator trong lúc đối soát liên bảng. Với snapshot rỗng, dùng một schema nguồn thử nghiệm đầy đủ DDL nhưng chưa seed; không xóa dữ liệu đang dùng để thử.
 
