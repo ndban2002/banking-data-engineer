@@ -114,6 +114,15 @@ def test_timestamp_parsing_keeps_microseconds_and_is_independent_of_driver_timez
             time.tzset()
 
 
+@pytest.mark.parametrize(("fraction", "microseconds"), [
+    ("6", 600000), ("60", 600000), ("600", 600000),
+    ("6009", 600900), ("60095", 600950), ("600950", 600950),
+])
+def test_spark_timestamp_parses_trimmed_fractional_seconds(fraction, microseconds):
+    assert parse_utc_timestamp(f"2026-11-19 07:23:34.{fraction}") == datetime(
+        2026, 11, 19, 7, 23, 34, microseconds, tzinfo=UTC)
+
+
 def test_source_settings_read_only_expected_environment_fields(monkeypatch):
     values = dict(host="localhost", port="15432", database="bank", schema="core_sim",
                   user="test_reader", password="test_password")

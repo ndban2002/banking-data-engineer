@@ -107,6 +107,10 @@ def parse_args(table: str, argv=None):
 def parse_utc_timestamp(value: str | None) -> datetime | None:
     if value is None:
         return None
+    # Spark trims trailing fractional zeros. Python 3.8's fromisoformat
+    # accepts only three or six fractional digits.
+    value = re.sub(r"^(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\.)(\d{1,5})(?!\d)",
+                   lambda match: match[1] + match[2].ljust(6, "0"), value)
     parsed = datetime.fromisoformat(value)
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
