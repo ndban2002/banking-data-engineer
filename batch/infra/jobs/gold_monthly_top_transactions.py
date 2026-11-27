@@ -10,6 +10,7 @@ import uuid
 from bronze_loader import identifier
 from gold_daily_merchant import MART as DAILY_MART, input_id, merchant_events, write_run
 from gold_rollups import completed_daily_run, write_mart
+from job_reporting import add_report_argument, emit_report
 from silver_loader import table_properties
 from silver_quality import TABLES
 
@@ -122,12 +123,13 @@ def materialize(spark, *, gold_namespace="gold") -> dict:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gold-namespace", default="gold")
+    add_report_argument(parser)
     args = parser.parse_args(argv)
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.appName("bank-sim-gold-monthly-top-transactions").getOrCreate()
     try:
-        print(json.dumps(materialize(spark, gold_namespace=args.gold_namespace), default=str))
+        emit_report(materialize(spark, gold_namespace=args.gold_namespace), orchestration=args.orchestration_report)
     finally:
         spark.stop()
 

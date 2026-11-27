@@ -14,8 +14,9 @@ import json
 import uuid
 
 from bronze_loader import current_snapshot_id, identifier
-from silver_loader import ensure_table, read_snapshot, table_properties
-from silver_quality import TABLES, check_silver
+from job_reporting import add_report_argument, emit_report
+from silver_loader import ensure_table, table_properties
+from silver_quality import TABLES, check_silver, processing_violations
 
 
 MART = "daily_merchant_performance"
@@ -124,35 +125,12 @@ def reconcile(spark, events, mart) -> dict:
         spark.catalog.dropTempView(prefix)
 
 
-def check_processing_complete(spark, frames: dict, namespace: str, binding: dict) -> dict:
-    """Refuse uncheckpointed rows or any unreviewed historical quarantine."""
-    from pyspark.sql import functions as F
-
-    controls = {}
-    for name in ("_processed_batches", "_quarantine"):
-        target = f"lakehouse.{namespace}.{name}"
-        if not spark.catalog.tableExists(target):
-            raise ValueError(f"missing Silver control table: {target}")
-        actual = table_properties(spark, target)
-        if any(actual.get(key) != value for key, value in binding.items()):
-            raise ValueError("Silver control tables have different source bindings")
-        controls[name] = read_snapshot(spark, target)
-    if controls["_quarantine"].limit(1).count():
-        raise ValueError("Silver quarantine is not empty; resolve/rebuild Silver before Gold")
-    completed = controls["_processed_batches"]
-    for source, frame in frames.items():
-        accepted = completed.where(F.col("silver_table") == f"lakehouse.{namespace}.{TABLES[source][0]}")
-        rows = frame.select(F.col("_batch_id").alias("batch_id"), F.col("_source_key").alias("source_key")).distinct()
-        if rows.join(accepted.select("batch_id", "source_key"), ["batch_id", "source_key"], "left_anti").limit(1).count():
-            raise ValueError("Silver has uncheckpointed output; retry Silver before Gold")
-    return controls
-
-
 def write_run(spark, target: str, record: dict) -> None:
     spark.createDataFrame([record], RUN_SCHEMA).writeTo(target).append()
 
 
-def materialize(spark, *, silver_namespace="silver", gold_namespace="gold") -> dict:
+def materialize(spark, *, silver_namespace="silver", gold_namespace="gold",
+                source_snapshots: dict | None = None) -> dict:
     from pyspark import StorageLevel
     from pyspark.sql import functions as F
 
@@ -167,6 +145,12 @@ def materialize(spark, *, silver_namespace="silver", gold_namespace="gold") -> d
     try:
         snapshots = {f"lakehouse.{silver_namespace}.{name}": current_snapshot_id(
             spark, f"lakehouse.{silver_namespace}.{name}") for name, _ in TABLES.values()}
+        if source_snapshots is not None:
+            if (not isinstance(source_snapshots, dict) or source_snapshots.keys() != snapshots.keys()
+                    or any(value is not None and type(value) is not int for value in source_snapshots.values())):
+                raise ValueError("expected Silver snapshots must map all four tables to integer snapshot IDs or null")
+            if source_snapshots != snapshots:
+                raise ValueError("current Silver snapshots differ from the quality gate; rerun Silver quality")
         quality = check_silver(spark, silver_namespace, snapshots=snapshots)
         if not quality["ok"]:
             raise ValueError(f"Silver quality gate failed: {quality['violations']}")
@@ -177,7 +161,11 @@ def materialize(spark, *, silver_namespace="silver", gold_namespace="gold") -> d
         source_properties = table_properties(spark, f"lakehouse.{silver_namespace}.dim_accounts")
         binding = {key: source_properties[key] for key in
                    ("silver.source_namespace", "silver.source_dataset", "silver.pipeline_version")}
-        check_processing_complete(spark, frames, silver_namespace, binding)
+        processing = processing_violations(spark, frames, silver_namespace, binding)
+        if processing["quarantined_rows"]:
+            raise ValueError("Silver quarantine is not empty; resolve/rebuild Silver before Gold")
+        if processing["uncheckpointed_batches"]:
+            raise ValueError("Silver has uncheckpointed output; retry Silver before Gold")
         events = merchant_events(spark, frames).persist(StorageLevel.MEMORY_AND_DISK)
         mart = build_mart(events).persist(StorageLevel.MEMORY_AND_DISK)
         row_count = mart.count()
@@ -228,13 +216,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--silver-namespace", default="silver")
     parser.add_argument("--gold-namespace", default="gold")
+    parser.add_argument("--source-snapshots", type=json.loads, default=argparse.SUPPRESS,
+                        help="JSON object of the four Silver snapshots expected from the quality gate")
+    add_report_argument(parser)
     args = parser.parse_args(argv)
+    if hasattr(args, "source_snapshots") and not isinstance(args.source_snapshots, dict):
+        parser.error("--source-snapshots must be a JSON object")
     from pyspark.sql import SparkSession
 
     spark = SparkSession.builder.appName("bank-sim-daily-merchant-gold").getOrCreate()
     try:
-        print(json.dumps(materialize(spark, silver_namespace=args.silver_namespace,
-                                     gold_namespace=args.gold_namespace), default=str))
+        report = materialize(spark, silver_namespace=args.silver_namespace, gold_namespace=args.gold_namespace,
+                             source_snapshots=getattr(args, "source_snapshots", None))
+        emit_report(report, orchestration=args.orchestration_report)
     finally:
         spark.stop()
 

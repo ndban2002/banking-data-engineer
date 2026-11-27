@@ -1,0 +1,6 @@
+telemetry:
+  enabled: false
+
+concurrency:
+  runs:
+    max_concurrent_runs: 1

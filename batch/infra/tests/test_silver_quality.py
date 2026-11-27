@@ -1,10 +1,14 @@
 """Exercise relational check predicates; actual Spark/Iceberg tests run separately."""
 
+import json
 import sqlite3
+import sys
+from types import SimpleNamespace
 
 import pytest
 
-from silver_quality import quality_queries
+from job_reporting import REPORT_PREFIX
+from silver_quality import main, quality_queries
 
 
 @pytest.fixture
@@ -109,3 +113,37 @@ def test_duplicate_business_keys_are_reported(quality_database):
     assert result["customers_key_unique"] == 1
     assert result["transactions_key_unique"] == 1
     assert result["transaction_request_unique"] == 1
+
+
+@pytest.mark.parametrize("orchestration", [False, True])
+def test_quality_cli_emits_report_before_exiting_on_violation(monkeypatch, capsys, orchestration):
+    stopped = []
+    spark = SimpleNamespace(stop=lambda: stopped.append(True))
+    builder = SimpleNamespace()
+    builder.appName = lambda *_: builder
+    builder.getOrCreate = lambda: spark
+    monkeypatch.setitem(sys.modules, "pyspark.sql", SimpleNamespace(SparkSession=SimpleNamespace(builder=builder)))
+    report = {"ok": False, "violations": {"account_balance_reconciliation": 1}}
+    if orchestration:
+        report["processing_violations"] = {"quarantined_rows": 0, "uncheckpointed_batches": 0}
+
+    def check(spark_session, namespace, *, require_processed):
+        assert spark_session is spark
+        assert namespace == "silver_fixture"
+        assert require_processed is orchestration
+        return report
+
+    monkeypatch.setattr("silver_quality.check_silver", check)
+    args = ["--namespace", "silver_fixture"]
+    if orchestration:
+        args.extend(["--orchestration-report", "--require-processed"])
+    with pytest.raises(SystemExit) as failure:
+        main(args)
+
+    assert failure.value.code == 1
+    output = capsys.readouterr().out
+    if orchestration:
+        assert output.startswith(REPORT_PREFIX)
+        output = output[len(REPORT_PREFIX):]
+    assert json.loads(output) == report
+    assert stopped == [True]

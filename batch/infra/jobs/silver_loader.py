@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 import hashlib
 import json
 
-from bronze_loader import SOURCE_PROPERTY, identifier, parse_utc_timestamp
+from bronze_loader import SOURCE_PROPERTY, current_snapshot_id, identifier, parse_utc_timestamp
+from job_reporting import add_report_argument, emit_report
 from silver_transform import SILVER_SPECS, prepare_batch
 
 
@@ -84,8 +85,6 @@ def ensure_table(spark, table: str, schema, properties: dict) -> None:
 
 def read_snapshot(spark, table: str):
     """Freeze an existing Silver table before computing this batch's changes."""
-    from bronze_loader import current_snapshot_id
-
     snapshot = current_snapshot_id(spark, table)
     if snapshot is None:
         return spark.table(table).limit(0)
@@ -268,6 +267,7 @@ def parse_args(argv=None):
     parser.add_argument("--silver-namespace", default="silver")
     parser.add_argument("--batch-id", help="Process one accepted batch of the selected table")
     parser.add_argument("--replay", action="store_true", help="Revisit already processed batches")
+    add_report_argument(parser)
     args = parser.parse_args(argv)
     try:
         identifier(args.bronze_namespace)
@@ -293,7 +293,11 @@ def main(argv=None) -> int:
             results.extend(process_table(spark, table, bronze_namespace=args.bronze_namespace,
                                          silver_namespace=args.silver_namespace,
                                          batch_id=args.batch_id, replay=args.replay))
-        print(json.dumps({"batches": results}, default=str))
+        report = {"batches": results}
+        if args.orchestration_report:
+            targets = [f"lakehouse.{args.silver_namespace}.{SILVER_SPECS[table].target_name}" for table in tables]
+            report["tables"] = {target: {"snapshot_id": current_snapshot_id(spark, target)} for target in targets}
+        emit_report(report, orchestration=args.orchestration_report)
         # A skipped historical rejection remains in the audit ledger, but is
         # not a new failure of this run. Publication must review quarantine
         # separately; exit 0 alone is not approval for Gold.

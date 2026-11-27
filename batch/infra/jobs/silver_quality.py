@@ -2,8 +2,7 @@
 
 Run after loading all four tables from a quiescent source. Pinning each Iceberg
 table makes this report repeatable; it does not create a shared PostgreSQL
-cutoff. Row-local quarantine is reported by the loader for each batch and must
-be reviewed separately; old quarantine history does not fail this gate forever.
+cutoff. Use --require-processed to include Silver quarantine and checkpoints.
 """
 
 from __future__ import annotations
@@ -13,6 +12,8 @@ import json
 import uuid
 
 from bronze_loader import current_snapshot_id, identifier
+from job_reporting import add_report_argument, emit_report
+from silver_loader import read_snapshot, table_properties
 
 
 TABLES = {
@@ -102,7 +103,33 @@ def quality_queries(views: dict[str, str]) -> dict[str, str]:
     return queries
 
 
-def check_silver(spark, namespace: str = "silver", *, snapshots: dict | None = None) -> dict:
+def processing_violations(spark, frames: dict, namespace: str, binding: dict) -> dict:
+    """Count quarantined rows and per-table batch references without checkpoints."""
+    from pyspark.sql import functions as F
+
+    controls = {}
+    for name in ("_processed_batches", "_quarantine"):
+        target = f"lakehouse.{namespace}.{name}"
+        if not spark.catalog.tableExists(target):
+            raise ValueError(f"missing Silver control table: {target}")
+        actual = table_properties(spark, target)
+        if any(actual.get(key) != value for key, value in binding.items()):
+            raise ValueError("Silver control tables have different source bindings")
+        controls[name] = read_snapshot(spark, target)
+
+    completed = controls["_processed_batches"]
+    uncheckpointed = 0
+    for source, frame in frames.items():
+        accepted = completed.where(F.col("silver_table") == f"lakehouse.{namespace}.{TABLES[source][0]}")
+        rows = frame.select(F.col("_batch_id").alias("batch_id"),
+                            F.col("_source_key").alias("source_key")).distinct()
+        uncheckpointed += rows.join(accepted.select("batch_id", "source_key"),
+                                   ["batch_id", "source_key"], "left_anti").count()
+    return {"quarantined_rows": controls["_quarantine"].count(), "uncheckpointed_batches": uncheckpointed}
+
+
+def check_silver(spark, namespace: str = "silver", *, snapshots: dict | None = None,
+                 require_processed: bool = False) -> dict:
     """Check one dataset, returning counts and the exact snapshots inspected.
 
     Missing tables, absent source bindings and unreadable snapshots raise rather
@@ -120,23 +147,22 @@ def check_silver(spark, namespace: str = "silver", *, snapshots: dict | None = N
     original_ansi = spark.conf.get("spark.sql.ansi.enabled")
     spark.conf.set("spark.sql.ansi.enabled", "true")
     prefix = "silver_check_" + uuid.uuid4().hex
-    views, snapshots = {}, {}
+    views, frames, snapshots = {}, {}, {}
     binding = None
     try:
         for source, (name, _) in TABLES.items():
             target = f"lakehouse.{namespace}.{name}"
             if not spark.catalog.tableExists(target):
                 raise ValueError(f"required Silver table is missing: {target}")
-            properties = {r["key"]: r["value"] for r in
-                          spark.sql(f"SHOW TBLPROPERTIES {target}").collect()}
-            current_binding = tuple(properties.get(key) for key in BINDING_KEYS)
-            if not all(current_binding):
+            properties = table_properties(spark, target)
+            current_binding = {key: properties.get(key) for key in BINDING_KEYS}
+            if not all(current_binding.values()):
                 raise ValueError(f"Silver table has no complete source binding: {target}")
             if binding is None:
                 binding = current_binding
             elif binding != current_binding:
                 raise ValueError("Silver tables are bound to different datasets or pipeline versions")
-            dataset = json.loads(current_binding[0])
+            dataset = json.loads(current_binding["silver.source_dataset"])
             if not isinstance(dataset, list) or len(dataset) != 3:
                 raise ValueError("invalid Silver source dataset binding")
             expected_key = json.dumps([*dataset, source], separators=(",", ":"))
@@ -150,12 +176,13 @@ def check_silver(spark, namespace: str = "silver", *, snapshots: dict | None = N
             view = f"{prefix}_{source}"
             frame.createOrReplaceTempView(view)
             views[source] = view
+            frames[source] = frame
         # Counts only: the report does not expose names, IDs or rejected payloads.
         violations = {name: spark.sql(query).count()
                       for name, query in quality_queries(views).items()}
         pending = spark.sql(f"SELECT COUNT(*) AS n FROM {views['transactions']} "
                             "WHERE status = 'PENDING'").first()["n"]
-        return {
+        report = {
             "ok": not any(violations.values()),
             "namespace": namespace,
             "snapshots": snapshots,
@@ -164,9 +191,15 @@ def check_silver(spark, namespace: str = "silver", *, snapshots: dict | None = N
             "not_checked": {
                 "historical_merchant_channel": "Current dimensions do not prove channel at settlement.",
                 "shared_source_cutoff": "Run after ingesting a quiescent source; table snapshots are separate.",
-                "batch_quarantine": "Review loader batch rejection counts and quarantine separately.",
             },
         }
+        if require_processed:
+            controls = processing_violations(spark, frames, namespace, binding)
+            report["processing_violations"] = controls
+            report["ok"] = report["ok"] and not any(controls.values())
+        else:
+            report["not_checked"]["batch_quarantine"] = "Review loader batch rejection counts and quarantine separately."
+        return report
     finally:
         for view in views.values():
             spark.catalog.dropTempView(view)
@@ -176,6 +209,9 @@ def check_silver(spark, namespace: str = "silver", *, snapshots: dict | None = N
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--namespace", default="silver")
+    parser.add_argument("--require-processed", action="store_true",
+                        help="Also require empty quarantine and checkpoints for the Silver output")
+    add_report_argument(parser)
     args = parser.parse_args(argv)
     try:
         identifier(args.namespace)
@@ -185,8 +221,8 @@ def main(argv=None) -> None:
 
     spark = SparkSession.builder.appName("bank-sim-silver-quality").getOrCreate()
     try:
-        report = check_silver(spark, args.namespace)
-        print(json.dumps(report))
+        report = check_silver(spark, args.namespace, require_processed=args.require_processed)
+        emit_report(report, orchestration=args.orchestration_report)
         if not report["ok"]:
             raise SystemExit(1)
     finally:

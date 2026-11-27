@@ -14,6 +14,8 @@ import re
 from urllib.parse import quote
 import uuid
 
+from job_reporting import add_report_argument, emit_report
+
 SOURCE_SYSTEM = "banking-simulator"
 SOURCE_PROPERTY = "bank_sim.source_key"
 
@@ -92,6 +94,7 @@ def parse_args(table: str, argv=None):
                         default="incremental" if spec.watermark_column else "full")
     parser.add_argument("--overlap-minutes", type=int, default=5)
     parser.add_argument("--namespace", default="bronze", help="Iceberg namespace in lakehouse (default: bronze)")
+    add_report_argument(parser)
     args = parser.parse_args(argv)
     if args.overlap_minutes < 0 or args.overlap_minutes > 525600:
         parser.error("--overlap-minutes must be between 0 and 525600")
@@ -316,6 +319,6 @@ def main(table: str, argv=None) -> None:
     try:
         result = load_table(spark, settings, TABLES[table], mode=args.mode,
                             overlap_minutes=args.overlap_minutes, namespace=args.namespace)
-        print(json.dumps(result, default=str))
+        emit_report(result, orchestration=args.orchestration_report)
     finally:
         spark.stop()

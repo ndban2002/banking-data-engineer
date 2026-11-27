@@ -4,6 +4,7 @@ Run with spark-submit after copying this file AND test_silver_runtime.py to
 the same container directory. Regular pytest skips the runtime tests.
 """
 from datetime import datetime, timedelta, timezone
+import json
 import os
 from pathlib import Path
 import sys
@@ -144,6 +145,9 @@ class GoldRuntimeTests(unittest.TestCase):
         self.assertEqual(before, self.rows())
         self.spark.sql(f"UPDATE {accounts} SET balance_vnd = balance_vnd - 1 WHERE customer_id IS NOT NULL")
         self.load("transactions", [fixtures.transaction("bad-amount", amount=-1)])
+        gate = self.gold.check_silver(self.spark, self.fixture.silver_ns, require_processed=True)
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["processing_violations"], {"quarantined_rows": 1, "uncheckpointed_batches": 0})
         with self.assertRaisesRegex(ValueError, "quarantine"):
             self.build()
         self.assertEqual(before, self.rows())
@@ -155,7 +159,13 @@ class GoldRuntimeTests(unittest.TestCase):
                 self.build()
         before = self.rows()
         self.assertEqual(self.spark.table(f"lakehouse.{self.gold_ns}._materializations").count(), 0)
-        self.build()
+        first = self.build()
+        self.assertEqual(before, self.rows())
+        expected = json.loads(first["source_snapshots"])
+        fact = f"lakehouse.{self.fixture.silver_ns}.fact_transactions"
+        with self.assertRaisesRegex(ValueError, "differ from the quality gate"):
+            self.gold.materialize(self.spark, silver_namespace=self.fixture.silver_ns, gold_namespace=self.gold_ns,
+                                  source_snapshots={**expected, fact: expected[fact] + 1})
         self.assertEqual(before, self.rows())
         # Modify live input after the gate. Gold still uses precisely the checked snapshots.
         real_check = self.gold.check_silver
@@ -179,6 +189,9 @@ class GoldRuntimeTests(unittest.TestCase):
         self.build()
         tx_table = f"lakehouse.{self.fixture.silver_ns}.fact_transactions"
         self.spark.sql(f"UPDATE {tx_table} SET _batch_id = 'unfinished'")
+        gate = self.gold.check_silver(self.spark, self.fixture.silver_ns, require_processed=True)
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["processing_violations"], {"quarantined_rows": 0, "uncheckpointed_batches": 1})
         with self.assertRaisesRegex(ValueError, "uncheckpointed"):
             self.build()
         self.spark.sql(f"DELETE FROM {tx_table}")

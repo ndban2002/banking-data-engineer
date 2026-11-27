@@ -1,0 +1,36 @@
+name: Batch smoke tests
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/batch-smoke.yml
+      - batch/infra/jobs/**
+      - batch/infra/tests/**
+      - batch/orchestrator/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/batch-smoke.yml
+      - batch/infra/jobs/**
+      - batch/infra/tests/**
+      - batch/orchestrator/**
+
+permissions:
+  contents: read
+
+jobs:
+  batch-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r batch/orchestrator/requirements-dev.txt
+      - name: Run Dagster smoke tests
+        working-directory: batch/orchestrator
+        run: python -m pytest -q
+      - name: Run Spark job unit tests
+        run: python -m pytest batch/infra/tests -q
